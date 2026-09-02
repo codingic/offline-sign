@@ -1,0 +1,9 @@
+# 与 allchain-rust-sdk 保持一致的工具链钉版。
+#
+# 为什么这里必须再钉一次：`rust-toolchain.toml` 只从**当前工作目录向上**查找，
+# 本 crate 位于 allchain-rust-sdk 之外，构建时不会读到 SDK 根目录的那份，
+# 会回落到系统默认 toolchain（本机为 1.90.0）——与工程要求的 1.93.0 不符，
+# 且 edition 2024 / 若干依赖（near-primitives、sui-sdk-types 等）会撞版本约束。
+[toolchain]
+channel = "1.93.0"
+components = ["rustfmt", "clippy"]
