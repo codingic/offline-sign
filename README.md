@@ -154,15 +154,15 @@ export SIGN_PASSWORD='你的口令'
 
 ```json
 {
-  "chaintype": "eth",
+  "chaintype": "btc",
   "txdatahex": "0x<完整交易序列化后的字节，hex 可带 0x 前缀>",
   "fromaddress": "<GET /v1/chains 返回的地址>",
-  "context": null
+  "context": { ... }
 }
 ```
 
 `context`：**只有 BTC 需要**，其余链必须省略（传了会报错，不静默忽略）。
-内容是把 SDK `build_transfer` 下发的 `extra.submit_context` **原样**搬过来，见 [§4.1](#41-btc-是唯一需要-context-的链)。
+内容是把 SDK `build_transfer` 下发的 `extra.submit_context` **原样**搬过来，见 [§4.1](#41-btc-的两个特殊之处)。
 
 行为：
 
@@ -218,7 +218,7 @@ export SIGN_PASSWORD='你的口令'
 | 字段 | 含义 |
 |---|---|
 | `public_key` | 该链所用编码的公钥 hex（btc 为**压缩** 33 字节；eth 为**非压缩** 65 字节） |
-| `assembles_full_tx` | 本服务是否直接产出可广播交易。TON 与 BTC 为 `false` |
+| `assembles_full_tx` | 本服务是否直接产出可广播交易。TON、BTC、ICP 为 `false` |
 | `needs_context` | 签名时是否必须带 `context`。只有 BTC 为 `true` |
 
 集成方可以据此判断流程：拿到 `needs_context: true` 的链，就得把
@@ -251,7 +251,7 @@ export SIGN_PASSWORD='你的口令'
 
 | 链 | `txdatahex` = 完整交易的序列化字节 | 解析方式 | `signed_tx` 编码 | 组装产物 |
 |----|--------------------------------------|----------|------------------|----------|
-| `btc` | **未签名交易**的序列化字节（`unsigned_tx_hex`），SegWit 版本 + 输入（空 scriptSig）+ 输出 | `bitcoin::consensus::encode::deserialize` | —（只出签名） | 由 **SDK 的 `submit_tx`** 组装 |
+| `btc` | **未签名交易**的序列化字节（`unsigned_tx_hex`），SegWit 版本 + 输入（空 witness）+ 输出 | `bitcoin::consensus::encode::deserialize` | —（只出签名） | 由 **SDK 的 `submit_tx`** 组装 |
 | `eth` | EIP-2718 类型化交易（**无签名段**）的 RLP：`0x02` ‖ RLP(\[chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data, accessList\]) | `alloy::consensus::TypedTransaction::decode_unsigned` | hex | **裸** `EthereumTxEnvelope`（EIP-2718）可直接 `eth_sendRawTransaction` |
 | `sol` | `solana_sdk::transaction::Transaction` 的 **bincode** 字节（签名槽留空） | `bincode::deserialize` | base64 | 填好 `signatures[0]` 的 `Transaction` 可直接 `sendTransaction` |
 | `near` | `near_primitives::transaction::Transaction` 的 **Borsh** 字节（签名 = None） | `borsh::BorshDeserialize::try_from_slice` | hex | `SignedTransaction`（Borsh）可直接 `broadcast_tx_commit` |
@@ -284,7 +284,7 @@ export SIGN_PASSWORD='你的口令'
 > | `sui` | `[0,0,0]`（intent：scope / version / app_id）‖ `BCS(Transaction)` | `sui-sdk-types-0.0.7/src/hash.rs` 的 `Transaction::signing_digest()` |
 > | `sol` | `Message::serialize()` —— 只签 message，不含签名段 | 官方 `Transaction::try_partial_sign` 内部的 `message_data()` |
 > | `eth` | `keccak256(0x02 ‖ RLP(...))`，由 alloy 签名器算 | EIP-2718 / EIP-1559 |
-> | `btc` | 每个输入各自的 sighash（P2WPKH 走 BIP143，含金额） | BIP143，见 §4.1 |
+> | `btc` | 每个输入各自的 sighash（**P2WPKH 走 BIP143，含金额**） | BIP143，见 §4.1 |
 > | `ton` | 收到的**原始字节**，内部**不**额外哈希 | 刻意与其余各链统一口径 |
 >
 > 实现上守三条纪律：
@@ -306,13 +306,33 @@ export SIGN_PASSWORD='你的口令'
 >
 > Aptos 与 Sui 极易写反：**哈希不同，标志字节的位置也相反**。两者都用真实向量钉住了测试。
 
-### 4.1 BTC 是唯一需要 `context` 的链
+### 4.1 BTC 的两个特殊之处
 
-**为什么**：BTC 是 UTXO 模型，N 个输入要签 N 次。而 P2WPKH 走的是 **BIP143** sighash——
-它把**该输入的金额（sat）也混进哈希**（为了堵「硬件钱包被隐瞒真实输入金额 → 少找零」的攻击）。
-问题是：**金额不在交易字节里**。只给 `txdatahex`，签名器无从得知每个输入值多少钱。
+#### 1) N 个输入 → N 个签名
 
-所以 BTC 额外要一份上下文，即 SDK `build_transfer` 下发的 `extra.submit_context`：
+BTC 是 UTXO 模型，一笔交易的每个输入都要各签一次：N 个输入 → N 个 sighash → N 个签名，
+按索引与 `tx.input` 一一对应。**改动任何一个输入，其它所有输入的签名全部作废**。
+
+#### 2) 只支持 P2WPKH，因此必须带 `context`
+
+同一个公钥在 BTC 上能派生两类地址，对应两套**互不相通**的签名规则：
+
+| 类型 | 地址 | 锁定脚本 | 签名落在 | sighash 算法 | 需要输入金额 |
+|---|---|---|---|---|---|
+| **P2WPKH** | `bc1q…` | `OP_0 <h160>` | `witness` | **BIP143** | **需要** |
+| P2PKH | `1…` | `OP_DUP OP_HASH160 <h160> … OP_CHECKSIG` | `scriptSig` | 传统算法 | 不需要 |
+
+P2WPKH（2017 年 SegWit）是当前主流：见证数据享 75% 权重折扣，手续费比 P2PKH 低三到四成；
+签名挪出 txid 的计算范围，顺带修掉了交易延展性。主流钱包的默认接收地址都是 `bc1q…`。
+
+代价是 BIP143 的定义要求把**本输入的金额**混进摘要——这正是它比传统算法更安全的地方
+（堵住「硬件钱包被隐瞒真实输入金额 → 少找零」的攻击）。
+但金额**不在交易字节里**（`TxIn` 只有 `txid ‖ vout ‖ sequence`），
+所以必须由 `context` 提供。这就是 BTC 成为唯一需要额外入参那条链的原因。
+
+**P2PKH 输入会被明确拒绝**：`context` 里的 `script_type` 字段给出了明确信号，不需要靠猜。
+传统算法虽然不要金额、只凭 `txdatahex` 就能签，但同时支持两套会把「地址类型必须与
+签名算法配套」这条约束变成调用方的心智负担——宁可只支持一种、并把另一种拒绝得清清楚楚。
 
 ```json
 {
@@ -332,8 +352,8 @@ export SIGN_PASSWORD='你的口令'
 |---|---|---|
 | 1 | `network == "mainnet"` | 跨网签名（地址前缀不同，签名最终无效） |
 | 2 | `txdatahex` 重新序列化后 == `context.unsigned_tx_hex` | **金额来自 A 交易、结构来自 B 交易** → 签在另一笔交易上 |
-| 3 | 输入数量一致 | 越界 panic（密码学路径上不留 panic 点） |
-| 4 | `context.public_key` == 本 keystore 派生的公钥 | 钥匙与交易不是一套，SDK 侧必然验签失败 |
+| 3 | `context.public_key` == 本 keystore 派生的公钥 | 钥匙与交易不是一套，SDK 侧必然验签失败 |
+| 4 | 每个输入的 `script_type == "p2wpkh"`，且 `witness` 为空 | P2PKH 等遗留类型；以及传入的不是未签名模板 |
 
 > **为什么自己重算 sighash，而不是直接用 `signing_payloads[].sighash`**
 > SDK 已经把每个 sighash 算好放在 `extra.signing_payloads` 里了，直接拿去签最省事。
@@ -341,13 +361,12 @@ export SIGN_PASSWORD='你的口令'
 > 签名器会老老实实地对一笔它从未见过的摘要签出**完全有效**的签名——格式合法、能过本地验签，
 > 只有广播到全网时才会被拒，而报错（`non-mandatory-script-verify-flag`）不会告诉你哪里错了。
 > 这里改为**从 `txdatahex` + `context` 重算**，把「盲信」变成「先验再用」。
-> 重算出的哈希已与 SDK 的输出做过逐字节对拍（见 §8）。
 
 **产出**：每个输入一个 **64 字节紧凑签名** `r(32) ‖ s(32)`（**不是 DER**）。
 DER 长度可变（70–73 字节），两种都收就得靠长度猜，容易出错，所以只认定长。
 
-**分工**：本服务**只签名**。DER 编码、低 S 归一化（BIP62）、填见证 / scriptSig、
-逐输入验签并拼装，全部由 SDK 的 `submit_tx` 完成。
+**分工**：本服务**只签名**。DER 编码、低 S 归一化（BIP62）、填见证、
+逐输入验签并拼装，全部由 SDK 完成。
 
 ---
 
@@ -367,11 +386,11 @@ curl -X POST "http://127.0.0.1:7878/v1/signtx" \
   -d '{"chaintype":"sol","txdatahex":"0x...","fromaddress":"<上一步的 address>"}'
 # => {"data":{"signature":"0x...","signed_tx":"<base64 完整交易>","encoding":"base64",...}}
 
-# 3) BTC：必须带 context，且只返回签名（交易由 SDK 的 submit_tx 组装）
+# 3) BTC：必须带 context，且只返回签名（交易由 SDK 组装）
 #    下面三个值都来自 SDK `build_transfer` 的响应：
 #      txdatahex          <- data.unsigned_tx_hex
 #      context            <- data.extra.submit_context（原样搬过来）
-#      fromaddress        <- data.from（或 /v1/chains 里的 btc 地址）
+#      fromaddress        <- data.from（或 /v1/chains 里的 btc 地址，形如 bc1q...）
 curl -X POST "http://127.0.0.1:7878/v1/signtx" \
   -H 'Content-Type: application/json' \
   -d '{"chaintype":"btc","txdatahex":"02000000...","fromaddress":"bc1q...","context":{"network":"mainnet","public_key":"02...","inputs":[...],"outputs":[...],"unsigned_tx_hex":"02000000..."}}'
@@ -433,7 +452,7 @@ cp ~/.allchain-sign/keystore-*.json /path/to/safe/backup/
 
 ```bash
 cd /Users/wangbinmac/Documents/allchainsdk/sign
-cargo test          # 95 项
+cargo test          # 113 项
 cargo clippy --all-targets
 ```
 
@@ -448,8 +467,8 @@ cargo clippy --all-targets
 | blake2b 校验值 | Python `hashlib` |
 | ETH 地址 | secp256k1 私钥 = 1 的公开常量 |
 | APT / SUI / SOL / NEAR 地址 | `aptos init` 的真实输出（私钥→公钥→地址三元组） |
-| BTC 地址（P2WPKH + P2PKH） | Python 独立实现：`cryptography` 做点乘 + `hashlib` 的 sha256/ripemd160 + **手写** Base58Check 与 BIP173 bech32 |
-| BTC sighash（BIP143） | SDK `chain/btc` 的 `sighashes()` 真实输出（夹具由 SDK 侧导出） |
+| BTC 地址（P2WPKH） | Python 独立实现：`cryptography` 做点乘 + `hashlib` 的 sha256/ripemd160 + **手写** BIP173 bech32 |
+| BTC sighash（BIP143） | 官方 **BIP143 测试向量**（`c37af311…`，独立公开常量） |
 
 > 这些向量由 `/tmp/gen_vectors.py` 与独立 Python 脚本算出。
 > **别用本实现自己算的值当期望值**——那叫自证，实现错了测试也跟着错，永远绿。
@@ -519,18 +538,18 @@ vault 部分 25 个变异体（换 KDF 算法、改盐、去 AAD、把 `0600` �
 当前 **24/25 被杀死**，唯一存活的是已登记的等价变异体
 （`ct_eq` 换成 `==`——返回值恒等，只改时序特性，黑盒不可观测）。
 
-BTC 部分 8 个变异体，**8/8 被杀死**：
+BTC 部分 3 个变异体（改为「只支持 P2WPKH」后重新实测），**3/3 被杀死**：
 
 | 变异 | 被哪条测试杀死 |
 |---|---|
-| 地址改用非压缩公钥 | `btc_addresses_match_an_independent_implementation` |
-| 去掉「txdatahex 与 context 同笔交易」校验 | `a_mismatched_txdatahex_is_rejected` |
-| p2wpkh 改用传统 sighash | `a_p2wpkh_input_is_not_signed_with_the_legacy_algorithm` |
-| 去掉公钥一致性校验 | `signing_with_a_different_key_is_rejected` |
-| 去掉网络校验 | `a_testnet_context_is_rejected` |
-| 去掉输入数量校验 | `a_context_with_the_wrong_input_count_is_rejected` |
-| 未知脚本类型兜底当 p2wpkh | `an_unknown_script_type_is_rejected` |
-| 去掉曲线检查 | `an_ed25519_key_is_rejected` |
+| 去掉「只接受 `p2wpkh`」校验 | `a_p2pkh_input_is_rejected` / `an_unknown_script_type_is_rejected` |
+| 把输入金额恒置为 0（不参与哈希） | `signatures_verify_against_the_independently_computed_sighash` |
+| `SIGHASH_ALL` 改成 `SIGHASH_NONE` | `changing_an_input_value_invalidates_that_inputs_signature` |
+
+> 第二个变异同时红了「改输入金额后签名应作废」那条，这条测试还钉住一个
+> 容易搞反的细节：**金额只进入本输入那一条 sighash**。
+> BIP143 的 `hashPrevouts` / `hashSequence` 只覆盖各输入的 outpoint 与 sequence，
+> 不含金额——所以改第 1 个输入的金额，第 0 个输入的 sighash 不变。
 
 hex 入参层 4 个变异体，**4/4 被杀死**：去掉 `strip_0x`+`trim`、只去掉 `trim`、
 只去掉 `strip_0x`、以及把解码错误吞掉改成返回空字节。
@@ -558,8 +577,10 @@ hex 入参层 4 个变异体，**4/4 被杀死**：去掉 `strip_0x`+`trim`、�
 > （在「两个地址不相等」那种弱断言下都**存活**了，是真实向量把它们抓住的），
 > 以及 BTC 的 `recomputed_sighashes_match_the_sdk_output` —— 该测试在测试代码里
 > **重算**了一遍哈希，所以把 `sign_btc` 的脚本类型分派改坏时它**仍然是绿的**。
-> 为此补了 `a_p2wpkh_input_is_not_signed_with_the_legacy_algorithm`：
-> 先断言两种算法在本夹具上确实不同（否则测试是空的），再断言真实签名**验不过**传统摘要。
+> 它的教训被固化了下来：现在的 `signatures_verify_against_the_independently_computed_sighash`
+> 用**外部真值公钥常量**验签，sighash 也由测试自己算，
+> 而不是复述生产代码的派生逻辑——「生产怎么写、测试就怎么抄」正是那次盲区的根因。
+> 此外 BIP143 的 sighash 直接对拍**官方向量**常量，不依赖本工程任何一行代码。
 >
 > 第四个盲区是另一种形态：ETH 的 `signed_tx` 多套了一层 RLP（`0xb87502f872…`），
 > 它能藏在 62 项全绿里，是因为当时 eth.rs **只有解码测试、没有任何一条断言过产出**。

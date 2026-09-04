@@ -1,6 +1,7 @@
 // 本文件的测试原内联在父模块的 `#[cfg(test)] mod tests` 中，
 // 抽到这里作为子模块文件（做法 1：子模块文件，保留对父模块私有项的访问）。
     use super::*;
+
     use crate::store::KeyStore;
     use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 
@@ -162,9 +163,9 @@
     /// 私钥 1 的**压缩**公钥（33 字节）。
     const BTC_VECTOR_PUBKEY_1: &str =
         "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-    /// 私钥 1 的主网 P2WPKH 地址（BIP173 官方示例用的正是这个 hash160）。
+    /// 私钥 1 的主网 **P2WPKH** 地址——本服务暴露的就是这一类。
     const BTC_VECTOR_P2WPKH_1: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-    /// 私钥 1 的主网 P2PKH 地址（仅作对照，本服务不使用）。
+    /// 私钥 1 的主网 P2PKH 地址（仅作对照，本服务不签发这类地址）。
     const BTC_VECTOR_P2PKH_1: &str = "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH";
     /// 种子 `0x11 * 32` 的压缩公钥。
     const BTC_VECTOR_PUBKEY_11: &str =
@@ -212,6 +213,10 @@
             BTC_VECTOR_P2PKH_1,
             "btc: 同一 hash160 的 P2PKH 地址不符（说明 hash160 或网络不对）"
         );
+        assert_ne!(
+            BTC_VECTOR_P2PKH_1, BTC_VECTOR_P2WPKH_1,
+            "两类地址必须不同，否则上面那条对照就是空的"
+        );
     }
 
     /// BTC 地址格式：主网原生隔离见证（`bc1q` 开头，42 字符）。
@@ -248,7 +253,8 @@
             eth.public_key.len(),
             "BTC 应为压缩公钥、ETH 为非压缩，长度必须不同"
         );
-        // P2WPKH 与 P2PKH 是两套地址，本服务只出 P2WPKH。
+        // P2WPKH 与 P2PKH 是两套地址，本服务只出 P2WPKH
+        // （P2PKH 是 2017 年前的遗留类型，走另一套 sighash 算法）。
         assert!(
             !btc.address.starts_with('1'),
             "不应输出 P2PKH 地址: {}",

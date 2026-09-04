@@ -129,3 +129,51 @@
              否则调用方传错东西时会静默签出无效签名"
         );
     }
+
+    /// **反向反证（加密正确性）**：`signed_tx` 里的签名必须能恢复出签名者地址，
+    /// 且与该 keystore 在 eth 上的地址一致。
+    ///
+    /// # 为什么这条不能少
+    ///
+    /// 上面的 `signed_tx_is_a_bare_eip2718_envelope` 只断言「能解回、字段对」——
+    /// 那挡不住「签名算错了一个字节、但 RLP 结构仍然合法」的情况：本地解回照样成功，
+    /// 只有节点广播时才拒绝。恢复出地址并比对，等于在本地就跑了一遍节点会做的 ECDSA 验签，
+    /// 把「签名到底对不对」这件事从「广播后才暴露」提前到「单测里就红」。
+    ///
+    /// # 语法要点
+    ///
+    /// `recover_signer()` 走的是与节点完全相同的恢复路径（含 EIP-155 的 y-parity），
+    /// 返回 `Result<Address>`；它内部用交易哈希 + 签名反算公钥再派生地址，
+    /// 与「先 `sign_transaction` 再 `into_envelope`」正反向闭环。
+    #[tokio::test]
+    async fn signed_tx_signature_recovers_to_the_signer() {
+        use alloy::consensus::{EthereumTxEnvelope, TxEip1559};
+        use alloy::consensus::transaction::SignerRecoverable;
+        use alloy::eips::eip2718::Decodable2718;
+        use alloy::primitives::Address;
+
+        let seed = [1u8; 32];
+        let key = StoredKey { scheme: Scheme::Secp256k1, seed };
+        let r = sign_eth(SDK_UNSIGNED_TX_HEX, &key)
+            .await
+            .expect("真实向量应能签名");
+        let raw = r.signed_tx.expect("ETH 必须产出 signed_tx");
+
+        let bytes = hex::decode(&raw[2..]).expect("signed_tx 应是合法 hex");
+        let env: EthereumTxEnvelope<TxEip1559> =
+            EthereumTxEnvelope::decode_2718(&mut bytes.as_slice())
+                .expect("产出的字节必须能被解回一个信封");
+        // `recover_signer` 是 `TypedTxEnvelope` 的方法：用交易哈希 + 签名反算公钥地址。
+        let signer: Address = env
+            .recover_signer()
+            .expect("signed_tx 的签名必须能恢复出签名者");
+
+        let expected = crate::keys::derive("eth", &seed)
+            .expect("derive 不应失败")
+            .address;
+        assert_eq!(
+            format!("{signer:#x}"),
+            expected,
+            "signed_tx 的签名应恢复到本 keystore 在 eth 上的地址（说明签的是这笔交易、且密钥正确）"
+        );
+    }

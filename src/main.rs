@@ -388,6 +388,17 @@ async fn signtx_handler(
             )
         }
     };
+    // `context` 已废弃：BTC 现只支持 P2PKH，传统 sighash 不含金额，
+    // `txdatahex` 成了唯一输入，不再需要 SDK 下发的 `submit_context`。
+    // 仍传它的调用方多半是按旧契约写的——显式报错比静默忽略更诚实，
+    // 否则对方会以为自己传的 `submit_context` 生效了（见 `SignBody::context` 的注释）。
+    if body.context.is_some() {
+        return err(
+            ErrorCode::InvalidArgument,
+            "context 已废弃：BTC 现只支持 P2PKH，txdatahex 是唯一输入，请勿再传 context",
+            &timer,
+        );
+    }
     match sign::sign(&body.chaintype, &body.txdatahex, body.context.as_ref(), &key).await {
         Ok(r) => {
             let data = json!({
