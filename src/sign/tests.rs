@@ -46,7 +46,7 @@
             out.signature
         );
         // 再钉一次产出形态：裸 EIP-2718（详见 eth.rs 的说明）。
-        let raw = out.signed_tx.expect("eth 应产出 signed_tx");
+        let raw = out.signedtxdatahex.expect("eth 应产出 signedtxdatahex");
         assert!(
             raw.starts_with("0x02"),
             "分派到 eth 后产出的应是 EIP-1559 信封，实际: {raw}"
@@ -65,14 +65,17 @@
             .await
             .expect("ton 对任意字节都应签名成功");
 
-        assert!(
-            out.signed_tx.is_none(),
-            "ton 只出签名、不组装交易；出现 signed_tx 说明被路由到了别的链"
-        );
+        // 路由判据：TON 不解析字节结构，所以对任意输入都签名成功——若被误接到
+        // 任何结构化链，两个任意字节解不开会直接报错。这里能成功就证明路由正确。
         let note = out.note.expect("ton 应带说明");
-        assert!(note.contains("钱包"), "说明应点明原因，实际: {note}");
+        assert!(note.contains("external message"), "说明应点明返回完整 external message，实际: {note}");
         // ed25519 签名 = 64 字节 = 128 hex，与上面的 ETH 判据互为对照。
         assert_eq!(out.signature.len(), 2 + 128, "ton 应是 64 字节签名");
+        // 统一契约：现在 TON 也返回 signedtxdatahex（签名前拼消息）。
+        let signed = out.signedtxdatahex.expect("ton 现在应返回 signedtxdatahex");
+        // 0x00ff -> 2 字节消息；signedtxdatahex 应为 0x + (64 字节签名) + 00ff。
+        let expected = format!("0x{}00ff", &out.signature[2..]);
+        assert_eq!(signed, expected, "ton 的 signedtxdatahex 应为「签名 ‖ 消息」前拼");
     }
 
     /// 其余各链**必须拒绝**任意字节——用来防止它们被误接到 `ton` 上。
@@ -104,14 +107,17 @@
             .await
             .expect("icp 对任意字节都应签名成功");
 
-        assert!(
-            out.signed_tx.is_none(),
-            "icp 只出签名、不组装信封；出现 signed_tx 说明被路由到了别的链"
-        );
+        // 路由判据：ICP 不解析字节结构，所以对任意输入都签名成功——若被误接到
+        // 任何结构化链，两个任意字节解不开会直接报错。这里能成功就证明路由正确。
         let note = out.note.expect("icp 应带说明");
-        assert!(note.contains("不组装"), "说明应点明原因，实际: {note}");
+        assert!(note.contains("CBOR") || note.contains("envelope"), "说明应点明须组装 CBOR envelope，实际: {note}");
         // ed25519 签名 = 64 字节 = 128 hex，与上面的 TON 判据互为对照。
         assert_eq!(out.signature.len(), 2 + 128, "icp 应是 64 字节签名");
+        // 统一契约：现在 ICP 也返回 signedtxdatahex（签名前缀字节）。
+        let signed = out.signedtxdatahex.expect("icp 现在应返回 signedtxdatahex");
+        // 0x00ff -> 2 字节消息；signedtxdatahex 应为 0x + (64 字节签名) + 00ff。
+        let expected = format!("0x{}00ff", &out.signature[2..]);
+        assert_eq!(signed, expected, "icp 的 signedtxdatahex 应为「签名 ‖ 待签字节」前拼");
     }
 
     /// BTC 缺 `context` 必须报错，且错误信息要说清**为什么**需要它。

@@ -31,7 +31,7 @@
 //! 所以必须由 `context` 提供。这就是 BTC 成为唯一需要额外入参那条链的原因。
 //!
 //! **P2PKH 输入会被明确拒绝**：`context` 里的 `script_type` 字段给出了明确信号，
-//! 不需要靠猜。传统算法虽然不要金额、只凭 `txdatahex` 就能签，但同时支持两套
+//! 不需要靠猜。传统算法虽然不要金额、只凭 `unsignedtxdatahex` 就能签，但同时支持两套
 //! 会把「地址类型必须与签名算法配套」这条约束变成调用方的心智负担——
 //! 宁可只支持一种、并把另一种拒绝得清清楚楚。
 //!
@@ -40,34 +40,37 @@
 //! `context` 就是 SDK `build_transfer` 下发的 `extra.submit_context`，
 //! 里面带齐了每个输入的 `value` 与 `script_pubkey`。
 //!
-//! 拿到金额后**不是直接拿来用**，而是从 `txdatahex` + `context` **重算**每个
+//! 拿到金额后**不是直接拿来用**，而是从 `unsignedtxdatahex` + `context` **重算**每个
 //! sighash，并在签之前用 `context.unsigned_tx_hex` 校验两者描述的是同一笔交易。
 //! 直接签 SDK 下发的 `signing_payloads[].sighash` 最省事，但那是**盲信**对侧：
 //! 一旦上下文在往返途中被改过（或调用方传错了笔交易），签出来的签名照样
 //! 是「有效签名」，只是签在另一笔交易上——而这类错误在广播前不会有任何提示。
 //! 重算就把「盲信」变成了「验证后使用」。
 //!
-//! # 分工：sign 只签名，SDK 只组装
+//! # 分工：sign 签名、且组装完整可广播交易
 //!
-//! 本函数**不**做 DER 编码、**不**做低 S 归一化（BIP62）、**不**填见证。
-//! 这三件事都由 SDK 在重组时完成，并在广播前逐个验签。
+//! 本函数把紧凑签名转成**比特币网络要求的形态**后，直接填进每个输入的 witness，
+//! 返回一笔可直接广播的交易（`signedtxdatahex`）。这样做的好处是调用方（SDK/前端）
+//! 拿到 `signedtxdatahex` 即可广播，不必再自己拼 witness——离线签名器的典型用法正是
+//! 「传未签名交易、拿回能广播的交易」。
 //!
-//! 理由与 TON 一致：让签名器去拼交易，出错时产出的是**格式合法但语义错误**的字节——
-//! 本地签名成功、序列化成功，直到广播才被节点以
-//! `non-mandatory-script-verify-flag` 拒掉，而错误信息不会告诉你错在哪一步。
+//! 依旧**不**改 nonce/金额/输出：交易结构全由 SDK 的 `build_transfer` 定好，
+//! sign 只负责「按 BIP143 算 sighash → 签名 → 装 witness」。装完立即用同一把公钥
+//! 重验 witness 里的 DER 签名（见函数末尾的自检），把「witness 填错形态/顺序」这类
+//! 「本地签名成功、广播才拒」的隐患前移成当场报错。
 //!
 //! # 输入 / 输出契约
 //!
-//! - **输入 `txdatahex`**：序列化后的**未签名交易**（witness 为空），与其余各链口径一致。
-//! - **输入 `context`**：SDK 下发的 `submit_context`；必须与 `txdatahex` 描述同一笔交易。
+//! - **输入 `unsignedtxdatahex`**：序列化后的**未签名交易**（witness 为空），与其余各链口径一致。
+//! - **输入 `context`**：SDK 下发的 `submit_context`；必须与 `unsignedtxdatahex` 描述同一笔交易。
 //! - **输出**：`signatures` = 与输入一一对应的 **64 字节紧凑签名**（`r || s`）十六进制数组；
-//!   `signed_tx` = `None`（组装是 SDK 的事）。
+//!   `signedtxdatahex` = 已填好 witness 的**完整可广播 segwit 交易**（`0x` + hex）。
 
 use bitcoin::consensus::encode;
 use bitcoin::hashes::Hash;
-use bitcoin::secp256k1::{Message, PublicKey as SecpPublicKey, Secp256k1, SecretKey};
+use bitcoin::secp256k1::{ecdsa::Signature as SecpSignature, Message, PublicKey as SecpPublicKey, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
-use bitcoin::{Amount, ScriptBuf, Transaction};
+use bitcoin::{Amount, ScriptBuf, Transaction, Witness};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -76,6 +79,12 @@ use crate::store::{Scheme, StoredKey};
 
 /// 紧凑签名的长度：`r(32) || s(32)`。
 const COMPACT_SIGNATURE_LEN: usize = 64;
+
+/// `SIGHASH_ALL` 在 witness 签名尾追加的字节（BIP143 规定 All = 1）。
+///
+/// 比特币网络要求 witness 里的签名是 `DER 编码 || <sighash 字节>` 的形态，
+/// 光有签名本体还不够——节点会按这个尾巴判断签名覆盖哪些输入/输出。
+const SIGHASH_ALL_BYTE: u8 = 0x01;
 
 /// 本服务只认主网（理由见 `keys::btc_info`：地址编码含网络前缀，换网络就是另一套地址）。
 const EXPECTED_NETWORK: &str = "mainnet";
@@ -106,7 +115,7 @@ struct SubmitContext {
     /// 签名所用公钥（压缩格式，33 字节，十六进制）。
     public_key: String,
     inputs: Vec<ContextInput>,
-    /// 构造阶段的未签名交易字节，用于校验「上下文与 txdatahex 是同一笔交易」。
+    /// 构造阶段的未签名交易字节，用于校验「上下文与 unsignedtxdatahex 是同一笔交易」。
     unsigned_tx_hex: String,
 }
 
@@ -121,14 +130,14 @@ struct ContextInput {
     script_type: String,
 }
 
-/// BTC 签名：从 `txdatahex` + `context` 重算逐输入 BIP143 sighash，逐个签出 64 字节紧凑签名。
+/// BTC 签名：从 `unsignedtxdatahex` + `context` 重算逐输入 BIP143 sighash，逐个签出 64 字节紧凑签名。
 ///
 /// # 输入 / 输出都是 hex 字符串
 ///
-/// - **入参 `txdatahex: &str`**：序列化后的**未签名交易**的 hex（可带 `0x`、可有首尾空白）。
+/// - **入参 `unsignedtxdatahex: &str`**：序列化后的**未签名交易**的 hex（可带 `0x`、可有首尾空白）。
 /// - **出参**：每个输入一个 `"0x" + 128 位 hex`，即 64 字节紧凑签名 `r(32) ‖ s(32)`。
 ///
-/// 两端都用 hex 字符串，是为了与 HTTP 请求体里的 `txdatahex` 字段、以及 SDK
+/// 两端都用 hex 字符串，是为了与 HTTP 请求体里的 `unsignedtxdatahex` 字段、以及 SDK
 /// 期望的签名数组形态**直接对齐**，中间不再有一次「谁负责编解码」的猜测。
 ///
 /// # 语法要点
@@ -137,7 +146,7 @@ struct ContextInput {
 /// 这里才做「结构化」。把反序列化留在本函数内部，错误处理就能带上
 /// 「你传的应该是什么」这句人话，而不是一句类型不匹配。
 pub fn sign_btc(
-    txdatahex: &str,
+    unsignedtxdatahex: &str,
     context: &Value,
     key: &StoredKey,
 ) -> anyhow::Result<SignedResult> {
@@ -168,20 +177,20 @@ pub fn sign_btc(
         ));
     }
 
-    // —— 第二道：`txdatahex` 与 context 必须描述同一笔交易 ——
+    // —— 第二道：`unsignedtxdatahex` 与 context 必须描述同一笔交易 ——
     //
-    // 这是整条链路上最重要的一次校验：金额与脚本来自 context、交易结构来自 txdatahex，
+    // 这是整条链路上最重要的一次校验：金额与脚本来自 context、交易结构来自 unsignedtxdatahex，
     // 两者若不是同一次 `build_transfer` 的产物，下面每一步都会「正常执行」，
     // 只是签在了另一笔交易上。
     // `decode_txdata` 只负责「hex 字符串 -> 字节」，错误信息里的
     // 「序列化的未签名交易」是本链补的那句话。
-    let txdata = decode_txdata(txdatahex, "BTC 未签名交易（序列化的未签名交易）")?;
-    let tx: Transaction = encode::deserialize(&txdata)
+    let txdata = decode_txdata(unsignedtxdatahex, "BTC 未签名交易（序列化的未签名交易）")?;
+    let mut tx: Transaction = encode::deserialize(&txdata)
         .map_err(|e| anyhow::anyhow!("BTC 交易解码失败（需序列化的未签名交易）: {e}"))?;
     let tx_hex = encode::serialize_hex(&tx);
     if tx_hex != strip_0x(ctx.unsigned_tx_hex.trim()) {
         return Err(anyhow::anyhow!(
-            "txdatahex 与 context.unsigned_tx_hex 不是同一笔交易：\
+            "unsignedtxdatahex 与 context.unsigned_tx_hex 不是同一笔交易：\
              两者必须来自同一次 build_transfer，否则签名会落在另一笔交易上"
         ));
     }
@@ -189,7 +198,7 @@ pub fn sign_btc(
     // 那是个「假成功」：调用方拿到 0 个签名去组装，报错会出现在完全无关的环节。
     if tx.input.is_empty() {
         return Err(anyhow::anyhow!(
-            "BTC 交易没有输入：txdatahex 不是一笔可签名的交易"
+            "BTC 交易没有输入：unsignedtxdatahex 不是一笔可签名的交易"
         ));
     }
 
@@ -222,7 +231,11 @@ pub fn sign_btc(
     // BIP143 的 `p2wpkh_signature_hash` 取 `&mut self`——它要往缓存里写
     // 「全部输出的哈希」这类中间结果，逐输入签名时能避免重复计算。
     let mut cache = SighashCache::new(&tx);
-    let mut signatures: Vec<[u8; COMPACT_SIGNATURE_LEN]> = Vec::with_capacity(tx.input.len());
+    // 收集原始 `Signature`：`serialize_compact()` 给调用方对账用的紧凑数组，
+    // `serialize_der()` 给下面填 witness 用的 DER 形态——两者同出一签。
+    let mut ecdsa_sigs: Vec<SecpSignature> = Vec::with_capacity(tx.input.len());
+    // 每个输入的 scriptCode + 金额，组装后自检 witness 时还要用。
+    let mut witness_metas: Vec<(ScriptBuf, Amount)> = Vec::with_capacity(tx.input.len());
 
     // 循环**以 `tx.input` 为准**：交易的真实输入就是必须签的全部，
     // 每个 `index` 去 `ctx.inputs` 取签名元数据。取不到说明 context 的 inputs
@@ -240,7 +253,7 @@ pub fn sign_btc(
         // 但重签一遍毫无意义，还可能覆盖已有签名。
         if !input.witness.is_empty() {
             return Err(anyhow::anyhow!(
-                "第 {index} 个输入的见证非空：txdatahex 必须是未签名交易模板（witness 为空）"
+                "第 {index} 个输入的见证非空：unsignedtxdatahex 必须是未签名交易模板（witness 为空）"
             ));
         }
         // 第四道：只支持 P2WPKH。
@@ -281,22 +294,73 @@ pub fn sign_btc(
 
         // 签名：输入是**已经是摘要**的 32 字节，不要再哈希一次。
         let message = Message::from_digest(sighash);
-        let sig = secp.sign_ecdsa(&message, &secret);
+        let mut raw = secp.sign_ecdsa(&message, &secret);
+        // 比特币主网要求低 S 规范的 DER 签名（BIP62/146）。`sign_ecdsa` 已默认低 S，
+        // 这里再显式归一化一次（幂等、零成本），兜底任何 secp256k1 版本差异。
+        raw.normalize_s();
+        let sig = raw;
 
-        // 自检：签完立刻用同一把公钥验一遍。
-        //
-        // 这不是冗余——它把「密钥与签名器不匹配」「内存被踩坏」这类
-        // 极低概率但后果致命的问题，变成一次当场报错，
-        // 而不是等到广播被拒时才发现。
+        // 自检：签完立刻用同一把公钥验一遍（防密钥/签名器不匹配、内存被踩）。
         secp.verify_ecdsa(&message, &sig, &public_key)
             .map_err(|e| anyhow::anyhow!("第 {index} 个输入的签名自检失败: {e}"))?;
 
-        signatures.push(sig.serialize_compact());
+        ecdsa_sigs.push(sig);
+        witness_metas.push((script, Amount::from_sat(meta.value)));
+    }
+
+    // 紧凑签名数组（r||s）：仍返回，供调用方对账/调试，与 `signature` 字段一致。
+    let signatures: Vec<[u8; COMPACT_SIGNATURE_LEN]> =
+        ecdsa_sigs.iter().map(|s| s.serialize_compact()).collect();
+
+    // —— 组装完整可广播交易：把每个输入的签名填进 witness ——
+    //
+    // 比特币网络要求 witness 里的签名是 **DER 编码 + SIGHASH 字节**（本服务内部为了计算
+    // BIP143 sighash 一直用紧凑签名 `r||s`，那是验签/存储友好的形态，但**不能直接进
+    // witness**——节点会以 `non-mandatory-script-verify-flag` 拒绝）。这里转成
+    // `DER || SIGHASH_ALL`，连同本密钥的压缩公钥，按 P2WPKH 的标准顺序
+    // `[签名, 公钥]` 填进对应输入的 witness；重新序列化（自动带上 witness、变成
+    // segwit 形态）即得一笔可直接广播的交易，无需 SDK 再拼。
+    // `cache` 对 `tx` 的不可变借用止于循环末尾（NLL），下面直接改 `tx.input[..].witness`。
+    for (index, sig) in ecdsa_sigs.iter().enumerate() {
+        let mut der = sig.serialize_der().to_vec();
+        der.push(SIGHASH_ALL_BYTE);
+        tx.input[index].witness = Witness::from_slice(&[der.as_slice(), ours.as_slice()]);
+    }
+
+    // 组装后自检：用同一笔交易重算 BIP143 sighash，验证 witness 里 DER 签名能验过——
+    // 直接锁死「witness 填对了（顺序、DER 形态、SIGHASH 字节）」，否则要等到广播才暴露。
+    let mut final_cache = SighashCache::new(&tx);
+    for (index, (script, value)) in witness_metas.iter().enumerate() {
+        let items = tx.input[index].witness.to_vec();
+        let der = match items.first() {
+            Some(d) => d,
+            None => return Err(anyhow::anyhow!(
+                "第 {index} 个输入的 witness 组装后为空：witness 未被正确填入"
+            )),
+        };
+        // witness 首项 = `DER 签名 || SIGHASH_ALL`；剥掉尾字节才是纯 DER，才能 `from_der`。
+        if der.last().copied() != Some(SIGHASH_ALL_BYTE) {
+            return Err(anyhow::anyhow!(
+                "第 {index} 个输入的 witness 签名尾字节不是 SIGHASH_ALL(0x01)"
+            ));
+        }
+        let recovered = SecpSignature::from_der(&der[..der.len() - 1])
+            .map_err(|e| anyhow::anyhow!("第 {index} 个输入的 DER 签名无法解码: {e}"))?;
+        let sh = final_cache
+            .p2wpkh_signature_hash(index, script, *value, EcdsaSighashType::All)
+            .map_err(|e| anyhow::anyhow!("第 {index} 个输入最终 sighash 失败: {e}"))?;
+        secp.verify_ecdsa(&Message::from_digest(sh.to_byte_array()), &recovered, &public_key)
+            .map_err(|e| anyhow::anyhow!("第 {index} 个输入组装后的 witness 验签失败: {e}"))?;
     }
 
     // `signature`（单数）保留第一个，让「单签名链」的调用方无需按链分支；
-    // BTC 的完整结果请看 `signatures`。
+    // BTC 的完整结果请看 `signatures` 与 `signedtxdatahex`。
     let first = *signatures.first().unwrap_or(&[0u8; COMPACT_SIGNATURE_LEN]);
+    // 完整可广播交易：witness 已填好的 segwit 交易，带 `0x` 前缀（与 ETH 的 `signedtxdatahex` 同约定）。
+    let signedtxdatahex = Some(format!("0x{}", encode::serialize_hex(&tx)));
+    // 链上 txid：double-SHA256 反序。`compute_txid()` 已按比特币白皮书的反序规则给出
+    // 标准显示序（即区块浏览器里看到的 txid），`Display` 输出小写 hex，再补 `0x` 前缀与全局约定对齐。
+    let txhash = Some(format!("0x{}", tx.compute_txid()));
 
     Ok(SignedResult {
         signature: format!("0x{}", hex::encode(first)),
@@ -304,12 +368,14 @@ pub fn sign_btc(
             .iter()
             .map(|s| format!("0x{}", hex::encode(s)))
             .collect(),
-        signed_tx: None,
+        signedtxdatahex,
+        txhash,
         encoding: "hex".to_string(),
         note: Some(
-            "BTC 只返回逐输入的 64 字节紧凑签名（r||s），按 P2WPKH 的 BIP143 sighash 签出；\
-             最终交易由 SDK 用 submit_context + signatures 组装并广播。\
-             本路径不支持 P2PKH 等遗留地址类型"
+            "BTC 返回逐输入的 64 字节紧凑签名（r||s，按 P2WPKH 的 BIP143 sighash 签出），\
+             同时 `signedtxdatahex` 是已填好 witness 的完整可广播交易（紧凑签名转 DER+SIGHASH_ALL 装配）。\
+             调用方可直接广播 `signedtxdatahex`，无需自己拼 witness。本路径不支持 P2PKH 等遗留地址类型。\
+             `txhash` 为本交易的链上 txid（double-SHA256 反序），可直接用于区块浏览器查询"
                 .to_string(),
         ),
     })

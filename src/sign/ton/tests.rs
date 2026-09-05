@@ -52,17 +52,39 @@
         );
     }
 
-    /// TON 刻意**不**组装交易：`signed_tx` 恒为 `None`，并给出说明。
+    /// TON 现在**装配**完整 external message：`signedtxdatahex` = 0x + (64字节签名 ‖ 消息字节)。
     #[test]
-    fn never_assembles_a_full_transaction() {
-        let out = sign_ton("0x00ff", &fixture_key()).expect("合法 hex 应能签名");
-        assert!(
-            out.signed_tx.is_none(),
-            "TON 必须只返回签名：完整 external message 需要钱包 code + state-init，\
-             通用签名器拼出来会打到错误地址"
+    fn assembles_complete_external_message() {
+        let key = fixture_key();
+        // 消息本体（不含签名）：前 64 字节位置由签名占用。
+        let body: Vec<u8> = b"ton external message body".to_vec();
+        let out = sign_ton(&hex::encode(&body), &key).expect("合法 hex 应能签名");
+
+        let signed = out
+            .signedtxdatahex
+            .expect("TON 现在应返回装配好的 external message");
+        let bytes = hex::decode(signed.strip_prefix("0x").expect("应带 0x"))
+            .expect("signedtxdatahex 应是合法 hex");
+
+        // 长度 = 64（签名）+ 消息本体长度。
+        assert_eq!(
+            bytes.len(),
+            64 + body.len(),
+            "signedtxdatahex 应是「64字节签名 ‖ 消息」，长度对不上"
         );
-        let note = out.note.expect("TON 应给出说明，避免调用方误以为能用 signed_tx");
-        assert!(note.contains("钱包"), "说明应点明原因，实际: {note}");
+        // 前 64 字节必须能独立验过「原始消息」——证明签的就是这段字节、且前拼顺序正确。
+        let sk = SigningKey::from_bytes(&key.seed);
+        let vk = VerifyingKey::from(&sk);
+        let sig_slice: [u8; 64] = bytes[..64].try_into().expect("前 64 字节应为签名");
+        assert!(
+            vk.verify(&body, &DalekSignature::from_bytes(&sig_slice)).is_ok(),
+            "前 64 字节必须是验得过消息本体的 ed25519 签名"
+        );
+        // 尾部必须是原消息字节（前拼，不是后拼）。
+        assert_eq!(&bytes[64..], &body[..], "签名应前拼到消息前，尾部须是原始消息");
+        // 说明应点明已返回完整 external message。
+        let note = out.note.expect("TON 应给出说明");
+        assert!(note.contains("external message"), "说明应点明返回完整 external message，实际: {note}");
     }
 
     /// 非 hex 输入必须报错，且错误信息点名 TON。

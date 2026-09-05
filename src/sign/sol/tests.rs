@@ -97,10 +97,10 @@
 
         // 产出：base64 的 bincode Transaction，且签名确实落在槽 0。
         use base64::Engine as _;
-        let raw = out.signed_tx.expect("SOL 必须产出 signed_tx");
+        let raw = out.signedtxdatahex.expect("SOL 必须产出 signedtxdatahex");
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(raw)
-            .expect("signed_tx 应是合法 base64");
+            .expect("signedtxdatahex 应是合法 base64");
         let signed: solana_transaction::Transaction =
             bincode::deserialize(&bytes).expect("产出应能解回 Transaction");
         assert_eq!(

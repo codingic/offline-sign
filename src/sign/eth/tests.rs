@@ -13,12 +13,12 @@
     // 但构造 `StoredKey` 字面量必须填满所有字段，所以这里要把 `Scheme` 也引进来。
     use crate::store::Scheme;
     #[test]
-    fn decodes_the_unsigned_tx_that_the_sdk_actually_emits() {
+    fn decodes_the_unsignedtxdatahex_that_the_sdk_actually_emits() {
         // 本 crate 没有 `hexutil`（那是 SDK workspace 的），这里手动剥 `0x`。
         // `trim_start_matches` 会把连续的前缀全去掉，对 `0x…` 而言恰好只去一次。
         let body = SDK_UNSIGNED_TX_HEX.trim_start_matches("0x");
         let bytes = hex::decode(body).expect("向量应是合法 hex");
-        let typed = decode_unsigned_tx(&bytes).expect("SDK 产出的未签名交易必须能被解码");
+        let typed = decode_unsignedtxdatahex(&bytes).expect("SDK 产出的未签名交易必须能被解码");
 
         // 类型字节：0x02 = EIP-1559。
         assert_eq!(bytes[0], 0x02, "向量应为 EIP-1559 交易");
@@ -59,7 +59,7 @@
         assert_eq!(u128::from(typed.gas_limit()), 21_000, "纯转账固定 21000 gas");
     }
 
-    /// **端到端产出**：`signed_tx` 必须是**裸的 EIP-2718 交易**，不能多套一层 RLP。
+    /// **端到端产出**：`signedtxdatahex` 必须是**裸的 EIP-2718 交易**，不能多套一层 RLP。
     ///
     /// # 这个 bug 是怎么藏住的
     ///
@@ -75,7 +75,7 @@
     /// 只断言「以 0x02 开头」还不够稳（万一将来改用别的类型字节呢），
     /// 所以再断言「不以 RLP 字符串头开头」，并把**解回来**的字段与原交易逐一对照。
     #[tokio::test]
-    async fn signed_tx_is_a_bare_eip2718_envelope() {
+    async fn signedtxdatahex_is_a_bare_eip2718_envelope() {
         use alloy::consensus::{EthereumTxEnvelope, TxEip1559};
         use alloy::eips::eip2718::Decodable2718;
 
@@ -84,22 +84,35 @@
         let r = sign_eth(SDK_UNSIGNED_TX_HEX, &key)
             .await
             .expect("真实向量应能签名");
-        let raw = r.signed_tx.expect("ETH 必须产出 signed_tx");
+        let raw = r.signedtxdatahex.expect("ETH 必须产出 signedtxdatahex");
 
         // 主断言：类型字节 0x02 = EIP-1559。
         assert!(
             raw.starts_with("0x02"),
-            "signed_tx 应以 EIP-1559 类型字节 0x02 开头，实际: {raw}"
+            "signedtxdatahex 应以 EIP-1559 类型字节 0x02 开头，实际: {raw}"
         );
         // 反证：不能带 RLP 字符串头。`b8` 是「长字符串」头，
         // 它出现在开头就说明又套了一层。
         assert!(
             !raw.starts_with("0xb8"),
-            "signed_tx 不应带 RLP 长字符串头（说明多套了一层 RLP 封装），实际: {raw}"
+            "signedtxdatahex 不应带 RLP 长字符串头（说明多套了一层 RLP 封装），实际: {raw}"
         );
 
         // 往返：解回来后字段必须与原交易一致——只比对前缀挡不住「类型字节对但内容错」。
-        let bytes = hex::decode(&raw[2..]).expect("signed_tx 应是合法 hex");
+        let bytes = hex::decode(&raw[2..]).expect("signedtxdatahex 应是合法 hex");
+        // txhash 独立校验：keccak256(signed bytes) 必须等于响应里的 txhash，且形态为 0x + 64 hex。
+        // `keccak256` 经 `use super::*` 已可见（来自 eth.rs 模块级 import）。
+        let expected = format!("0x{}", hex::encode(keccak256(&bytes).as_slice()));
+        assert_eq!(
+            r.txhash.as_deref(),
+            Some(expected.as_str()),
+            "txhash 应为 keccak256(signedtxdatahex 字节)"
+        );
+        let h = r.txhash.as_ref().unwrap();
+        assert!(
+            h.starts_with("0x") && h.len() == 66,
+            "ETH txhash 应为 0x + 64 位 hex，实际: {h}"
+        );
         let decoded: EthereumTxEnvelope<TxEip1559> =
             EthereumTxEnvelope::decode_2718(&mut bytes.as_slice())
                 .expect("产出的字节必须能被解回一个信封");
@@ -124,18 +137,18 @@
     fn rejects_a_bare_32_byte_signing_hash() {
         let hash = vec![0xab_u8; 32];
         assert!(
-            decode_unsigned_tx(&hash).is_err(),
+            decode_unsignedtxdatahex(&hash).is_err(),
             "契约规定输入是完整交易而非单独的待签哈希；喂哈希必须报错，\
              否则调用方传错东西时会静默签出无效签名"
         );
     }
 
-    /// **反向反证（加密正确性）**：`signed_tx` 里的签名必须能恢复出签名者地址，
+    /// **反向反证（加密正确性）**：`signedtxdatahex` 里的签名必须能恢复出签名者地址，
     /// 且与该 keystore 在 eth 上的地址一致。
     ///
     /// # 为什么这条不能少
     ///
-    /// 上面的 `signed_tx_is_a_bare_eip2718_envelope` 只断言「能解回、字段对」——
+    /// 上面的 `signedtxdatahex_is_a_bare_eip2718_envelope` 只断言「能解回、字段对」——
     /// 那挡不住「签名算错了一个字节、但 RLP 结构仍然合法」的情况：本地解回照样成功，
     /// 只有节点广播时才拒绝。恢复出地址并比对，等于在本地就跑了一遍节点会做的 ECDSA 验签，
     /// 把「签名到底对不对」这件事从「广播后才暴露」提前到「单测里就红」。
@@ -146,7 +159,7 @@
     /// 返回 `Result<Address>`；它内部用交易哈希 + 签名反算公钥再派生地址，
     /// 与「先 `sign_transaction` 再 `into_envelope`」正反向闭环。
     #[tokio::test]
-    async fn signed_tx_signature_recovers_to_the_signer() {
+    async fn signedtxdatahex_signature_recovers_to_the_signer() {
         use alloy::consensus::{EthereumTxEnvelope, TxEip1559};
         use alloy::consensus::transaction::SignerRecoverable;
         use alloy::eips::eip2718::Decodable2718;
@@ -157,16 +170,16 @@
         let r = sign_eth(SDK_UNSIGNED_TX_HEX, &key)
             .await
             .expect("真实向量应能签名");
-        let raw = r.signed_tx.expect("ETH 必须产出 signed_tx");
+        let raw = r.signedtxdatahex.expect("ETH 必须产出 signedtxdatahex");
 
-        let bytes = hex::decode(&raw[2..]).expect("signed_tx 应是合法 hex");
+        let bytes = hex::decode(&raw[2..]).expect("signedtxdatahex 应是合法 hex");
         let env: EthereumTxEnvelope<TxEip1559> =
             EthereumTxEnvelope::decode_2718(&mut bytes.as_slice())
                 .expect("产出的字节必须能被解回一个信封");
         // `recover_signer` 是 `TypedTxEnvelope` 的方法：用交易哈希 + 签名反算公钥地址。
         let signer: Address = env
             .recover_signer()
-            .expect("signed_tx 的签名必须能恢复出签名者");
+            .expect("signedtxdatahex 的签名必须能恢复出签名者");
 
         let expected = crate::keys::derive("eth", &seed)
             .expect("derive 不应失败")
@@ -174,6 +187,6 @@
         assert_eq!(
             format!("{signer:#x}"),
             expected,
-            "signed_tx 的签名应恢复到本 keystore 在 eth 上的地址（说明签的是这笔交易、且密钥正确）"
+            "signedtxdatahex 的签名应恢复到本 keystore 在 eth 上的地址（说明签的是这笔交易、且密钥正确）"
         );
     }

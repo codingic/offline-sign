@@ -30,7 +30,7 @@
         })
     }
 
-    /// **端到端产出**：`signed_tx` 必须能过**节点自己的验签**。
+    /// **端到端产出**：`signedtxdatahex` 必须能过**节点自己的验签**。
     ///
     /// # 这条测试抓到过一个真实缺陷
     ///
@@ -38,21 +38,21 @@
     /// 判据直接取自节点代码 `near-primitives-0.37.3/src/transaction.rs:291`：
     ///
     /// ```ignore
-    /// signed_tx.signature.verify(signed_tx.get_hash().as_ref(), signed_tx.transaction.public_key())
+    /// signedtxdatahex.signature.verify(signedtxdatahex.get_hash().as_ref(), signedtxdatahex.transaction.public_key())
     /// ```
     ///
     /// 签错对象时（签了裸 borsh 字节），签名在数学上完全合法、本地也验得过，
     /// 但节点回一个 `InvalidSignature` 就完事了——不告诉你签错了什么。
     #[test]
-    fn signed_tx_passes_the_nodes_own_signature_check() {
+    fn signedtxdatahex_passes_the_nodes_own_signature_check() {
         let key = fixture_key();
         let tx = fixture_tx(&key);
         let txdatahex = hex::encode(borsh::to_vec(&tx).expect("NEAR 交易应可 Borsh 序列化"));
 
         let out = sign_near(&txdatahex, &key).expect("合法的 NEAR 交易应能签名");
-        let raw = out.signed_tx.expect("NEAR 必须产出 signed_tx");
+        let raw = out.signedtxdatahex.expect("NEAR 必须产出 signedtxdatahex");
         let bytes = hex::decode(raw.strip_prefix("0x").expect("出参应带 0x"))
-            .expect("signed_tx 应是合法 hex");
+            .expect("signedtxdatahex 应是合法 hex");
         let signed: SignedTransaction =
             BorshDeserialize::try_from_slice(&bytes).expect("产出应能解回 SignedTransaction");
 

@@ -7,10 +7,10 @@
 //!
 //! # 输入 / 输出契约
 //!
-//! - **输入**：`txdatahex` —— hex 字符串（可带 `0x`），解码后是**完整交易**的
+//! - **输入**：`unsignedtxdatahex` —— hex 字符串（可带 `0x`），解码后是**完整交易**的
 //!   BCS 编码，即 `aptos_sdk::transaction::types::RawTransaction`
 //!   （Aptos 里未签名交易就叫 RawTransaction，它本身就是结构完整的交易体）。
-//! - **输出**：`signed_tx` = hex 的 BCS `SignedTransaction`，可直接 `submit`。
+//! - **输出**：`signedtxdatahex` = hex 的 BCS `SignedTransaction`，可直接 `submit`。
 //!
 //! # 与 SUI 的对比（两个最容易被写反的邻居）
 //!
@@ -36,9 +36,9 @@ use crate::store::StoredKey;
 /// authenticator 要同时带上**公钥与签名**，因为节点只有交易本身，
 /// 并不知道签名者是谁（Aptos 的账户地址是 `sha3-256(公钥 ‖ 0x00)`，
 /// 只有拿到公钥才能反推出该用哪个账户的序列号与余额）。
-pub fn sign_apt(txdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
+pub fn sign_apt(unsignedtxdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
     // hex 字符串 -> 字节。各链自己解码，报错时才能说清「这段字节本该是什么」。
-    let txdata = decode_txdata(txdatahex, "APT 完整交易（BCS RawTransaction）")?;
+    let txdata = decode_txdata(unsignedtxdatahex, "APT 完整交易（BCS RawTransaction）")?;
 
     let sk = Ed25519PrivateKey::from_bytes(&key.seed)
         .map_err(|e| anyhow::anyhow!("APT 私钥重建失败: {e}"))?;
@@ -79,9 +79,13 @@ pub fn sign_apt(txdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult
     Ok(SignedResult {
         signature: sig_hex.clone(),
         signatures: vec![sig_hex],
-        signed_tx: Some(format!("0x{}", hex::encode(out))),
+        signedtxdatahex: Some(format!("0x{}", hex::encode(out))),
+        txhash: None,
         encoding: "hex".to_string(),
-        note: None,
+        note: Some(
+            "APTOS 的 tx hash 为 hash(BCS(SignedTransaction))；本服务只返回 BCS 字节，\
+             调用方可对自身解 BCS 后按 Aptos 规则取哈希，故不另返 txhash".to_string(),
+        ),
     })
 }
 

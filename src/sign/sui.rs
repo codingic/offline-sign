@@ -7,9 +7,9 @@
 //!
 //! # 输入 / 输出契约
 //!
-//! - **输入**：`txdatahex` —— hex 字符串（可带 `0x`），解码后是**完整交易**的
+//! - **输入**：`unsignedtxdatahex` —— hex 字符串（可带 `0x`），解码后是**完整交易**的
 //!   BCS 编码，即 `sui_sdk_types::Transaction`（结构完整、只差签名）。
-//! - **输出**：`signed_tx` = base64 的 BCS `SignedTransaction`，
+//! - **输出**：`signedtxdatahex` = base64 的 BCS `SignedTransaction`，
 //!   可直接 `sui_executeTransactionBlock`。
 //!
 //! # 本链最容易踩的坑：intent 前缀
@@ -36,9 +36,9 @@ use crate::store::StoredKey;
 /// `UserSignature` 的字节布局是 `flag(1) ‖ signature(64) ‖ pubkey(32)`，
 /// 公钥**跟在签名后面**而不是放在别处；`flag = 0x00` 代表 ed25519 方案。
 /// 这个 97 字节的结构就是 Sui 节点认定「谁签的」的依据。
-pub fn sign_sui(txdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
+pub fn sign_sui(unsignedtxdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
     // hex 字符串 -> 字节。各链自己解码，报错时才能说清「这段字节本该是什么」。
-    let txdata = decode_txdata(txdatahex, "SUI 完整交易（BCS Transaction）")?;
+    let txdata = decode_txdata(unsignedtxdatahex, "SUI 完整交易（BCS Transaction）")?;
 
     let sk = SigningKey::from_bytes(&key.seed);
     let vk = VerifyingKey::from(&sk);
@@ -86,9 +86,13 @@ pub fn sign_sui(txdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult
     Ok(SignedResult {
         signature: sig_hex.clone(),
         signatures: vec![sig_hex],
-        signed_tx: Some(base64::engine::general_purpose::STANDARD.encode(&out)),
+        signedtxdatahex: Some(base64::engine::general_purpose::STANDARD.encode(&out)),
+        txhash: None,
         encoding: "base64".to_string(),
-        note: None,
+        note: Some(
+            "SUI 的 tx digest 为 BLAKE2b-256(BCS(SignedTransaction))；本服务只返回 BCS 字节，\
+             调用方可对自身解 BCS 后按 Sui 规则取 digest，故不另返 txhash".to_string(),
+        ),
     })
 }
 

@@ -16,14 +16,15 @@
 //!
 //! # 输入 / 输出契约
 //!
-//! - **输入**：`txdatahex` —— hex 字符串（可带 `0x`），解码后是**完整交易**的 RLP 编码
+//! - **输入**：`unsignedtxdatahex` —— hex 字符串（可带 `0x`），解码后是**完整交易**的 RLP 编码
 //!   （结构完整、只差签名；typed / legacy 均可），对应 MetaMask 离线签名那一套输入。
-//! - **输出**：`signed_tx` = hex 的 `EthereumTxEnvelope` RLP 字节，
+//! - **输出**：`signedtxdatahex` = hex 的 `EthereumTxEnvelope` RLP 字节，
 //!   可直接交给 `eth_sendRawTransaction`。
 
 use alloy::consensus::TypedTransaction;
 use alloy::eips::eip2718::Encodable2718;
 use alloy::network::TxSigner;
+use alloy::primitives::keccak256;
 use alloy::signers::local::PrivateKeySigner;
 use k256::ecdsa::SigningKey;
 
@@ -41,21 +42,21 @@ use crate::store::StoredKey;
 ///
 /// `pub` 是必需的：本函数在子模块 `sign::eth` 里，父模块 `sign` 要调用它，
 /// 不加 `pub` 的话它只在 `eth` 模块内可见（Rust 默认私有，且私有是**模块级**的）。
-fn decode_unsigned_tx(txdata: &[u8]) -> anyhow::Result<TypedTransaction> {
+fn decode_unsignedtxdatahex(txdata: &[u8]) -> anyhow::Result<TypedTransaction> {
     let mut buf = txdata;
     TypedTransaction::decode_unsigned(&mut buf)
         .map_err(|e| anyhow::anyhow!("ETH 交易解码失败（需 RLP 未签名交易）: {e}"))
 }
 
-pub async fn sign_eth(txdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
+pub async fn sign_eth(unsignedtxdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
     // hex 字符串 -> 字节。各链自己解码，报错时才能说清「这段字节本该是什么」。
-    let txdata = decode_txdata(txdatahex, "ETH 完整交易（RLP 未签名交易）")?;
+    let txdata = decode_txdata(unsignedtxdatahex, "ETH 完整交易（RLP 未签名交易）")?;
 
     let sk = SigningKey::from_slice(&key.seed)
         .map_err(|e| anyhow::anyhow!("ETH 种子非法: {e}"))?;
     let signer = PrivateKeySigner::from_signing_key(sk);
 
-    let mut typed = decode_unsigned_tx(&txdata)?;
+    let mut typed = decode_unsignedtxdatahex(&txdata)?;
 
     // 合金签名器负责算哈希、EIP-155 v、产出可恢复签名。
     let signature = signer
@@ -75,13 +76,20 @@ pub async fn sign_eth(txdatahex: &str, key: &StoredKey) -> anyhow::Result<Signed
     let tx_bytes = envelope.encoded_2718();
     // 单签名链：先把签名字符串绑成变量，`signature` 与 `signatures[0]` 共用同一个值。
     let sig_hex = format!("0x{}", hex::encode(signature.as_bytes()));
+    // 链上 tx hash：keccak256(可广播字节)。以太坊节点对 `eth_sendRawTransaction` 的入参
+    // 算出 `keccak256` 即为该交易 hash；EIP-2718 字节本身就是被哈希的对象，无需再套 RLP。
+    let txhash = Some(format!("0x{}", hex::encode(keccak256(&tx_bytes).as_slice())));
 
     Ok(SignedResult {
         signature: sig_hex.clone(),
         signatures: vec![sig_hex],
-        signed_tx: Some(format!("0x{}", hex::encode(tx_bytes))),
+        signedtxdatahex: Some(format!("0x{}", hex::encode(tx_bytes))),
+        txhash,
         encoding: "hex".to_string(),
-        note: None,
+        note: Some(
+            "ETH 的 txhash 为 keccak256(signedtxdatahex 字节)，随响应一并返回，\
+             可直接用于 eth_getTransactionReceipt / eth_getTransactionByHash 等查询".to_string(),
+        ),
     })
 }
 
@@ -93,7 +101,7 @@ pub async fn sign_eth(txdatahex: &str, key: &StoredKey) -> anyhow::Result<Signed
 /// # 为什么钉这一条
 ///
 /// SDK 与 sign 是两个**独立 crate**，只靠一句契约对接：
-/// 「`txdatahex` 是结构完整、只差签名的 RLP 未签名交易」。
+/// 「`unsignedtxdatahex` 是结构完整、只差签名的 RLP 未签名交易」。
 /// 契约一旦漂移（比如 SDK 哪天改成只发 32 字节待签哈希），
 /// 两侧各自的测试仍然全绿，**只有这条真实向量的解码测试会红**——
 /// 这正是跨 crate 集成最该守的位置。

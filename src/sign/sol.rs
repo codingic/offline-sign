@@ -7,10 +7,10 @@
 //!
 //! # 输入 / 输出契约
 //!
-//! - **输入**：`txdatahex` —— hex 字符串（可带 `0x`），解码后是**完整交易**
+//! - **输入**：`unsignedtxdatahex` —— hex 字符串（可带 `0x`），解码后是**完整交易**
 //!   （`solana_transaction::Transaction`）的 **bincode** 字节，
 //!   其中 `signatures[0]` 是占位空签名（Solana 的惯例：签名槽先留好位置再填）。
-//! - **输出**：`signed_tx` = base64 的 bincode 字节，可直接 `sendTransaction`。
+//! - **输出**：`signedtxdatahex` = base64 的 bincode 字节，可直接 `sendTransaction`。
 //!
 //! # 本链最容易踩的坑：待签字节到底是哪个
 //!
@@ -34,9 +34,9 @@ use crate::store::StoredKey;
 /// Solana 的 Keypair 直接由 32 字节 ed25519 **种子**重建（不是「私钥字节」，
 /// ed25519 的种子就是私钥）。这与 `keys::random_seed` 生成时用的表示一致，
 /// 所以从 keystore 解开的种子能原样还原出同一个 Keypair。
-pub fn sign_sol(txdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
+pub fn sign_sol(unsignedtxdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
     // hex 字符串 -> 字节。各链自己解码，报错时才能说清「这段字节本该是什么」。
-    let txdata = decode_txdata(txdatahex, "SOL 完整交易（bincode Transaction）")?;
+    let txdata = decode_txdata(unsignedtxdatahex, "SOL 完整交易（bincode Transaction）")?;
 
     // 由 32 字节种子直接重建 Keypair（与生成时一致：seed 即 ed25519 种子）。
     let kp = keypair_from_seed(&key.seed)
@@ -73,9 +73,13 @@ pub fn sign_sol(txdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult
     Ok(SignedResult {
         signature: sig_hex.clone(),
         signatures: vec![sig_hex],
-        signed_tx: Some(base64::engine::general_purpose::STANDARD.encode(&out)),
+        signedtxdatahex: Some(base64::engine::general_purpose::STANDARD.encode(&out)),
+        txhash: None,
         encoding: "base64".to_string(),
-        note: None,
+        note: Some(
+            "SOL 的链上 txid 即本交易唯一的 ed25519 签名（见 signatures[0]），\
+             与本服务的签名口径一致，故不另返 txhash；调用方可直接用 signatures[0] 作 txid 查询".to_string(),
+        ),
     })
 }
 

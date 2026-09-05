@@ -51,17 +51,40 @@
         );
     }
 
-    /// ICP 刻意**不**组装交易：`signed_tx` 恒为 `None`，并给出说明。
+    /// ICP 按统一契约返回 `signedtxdatahex`（签名前缀字节），但**不是**可直接广播的 CBOR envelope。
     #[test]
-    fn never_assembles_a_full_transaction() {
-        let out = sign_icp("0x00ff", &fixture_key()).expect("合法 hex 应能签名");
-        assert!(
-            out.signed_tx.is_none(),
-            "ICP 必须只返回签名：完整 ingress message 需要 caller / method / arg，\
-             通用签名器拼出来会打到错误的 canister"
+    fn returns_signature_prefixed_signedtxdatahex() {
+        let key = fixture_key();
+        let body: Vec<u8> = b"icp ingress message body".to_vec();
+        let out = sign_icp(&hex::encode(&body), &key).expect("合法 hex 应能签名");
+
+        let signed = out
+            .signedtxdatahex
+            .expect("ICP 现在也应返回 signedtxdatahex");
+        let bytes = hex::decode(signed.strip_prefix("0x").expect("应带 0x"))
+            .expect("signedtxdatahex 应是合法 hex");
+
+        assert_eq!(
+            bytes.len(),
+            64 + body.len(),
+            "signedtxdatahex 应是「64字节签名 ‖ 待签字节」"
         );
-        let note = out.note.expect("ICP 应给出说明，避免调用方误以为能用 signed_tx");
-        assert!(note.contains("不组装"), "说明应点明原因，实际: {note}");
+        // 前 64 字节必须验得过原始字节（签名绑定正确，顺序正确）。
+        let sk = SigningKey::from_bytes(&key.seed);
+        let vk = VerifyingKey::from(&sk);
+        let sig_slice: [u8; 64] = bytes[..64].try_into().expect("前 64 字节应为签名");
+        assert!(
+            vk.verify(&body, &DalekSignature::from_bytes(&sig_slice)).is_ok(),
+            "前 64 字节必须是验得过原始字节的 ed25519 签名"
+        );
+        // 说明必须点明这是签名前缀字节、须由调用方包进 CBOR envelope，不能直接广播。
+        let note = out
+            .note
+            .expect("ICP 应给出说明，避免调用方误把扁平字节当 envelope 广播");
+        assert!(
+            note.contains("CBOR") || note.contains("envelope"),
+            "说明应点明须组装 CBOR envelope，实际: {note}"
+        );
     }
 
     /// 非 hex 输入必须报错，且错误信息点名 ICP。

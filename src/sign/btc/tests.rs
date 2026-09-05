@@ -200,7 +200,7 @@
             sign_btc(&fixture_txdata(), &fixture_context(), &fixture_key()).expect("夹具应能正常签名");
 
         assert_eq!(result.signatures.len(), tx.input.len());
-        assert!(result.signed_tx.is_none(), "BTC 不组装交易");
+        assert!(result.signedtxdatahex.is_some(), "BTC 应返回组装好的完整交易");
         for (index, raw) in compact_signatures(&result).iter().enumerate() {
             assert_eq!(
                 raw.len(),
@@ -225,6 +225,64 @@
             assert!(
                 verify(&hashes[index], raw),
                 "第 {index} 个签名没能用真值公钥验过"
+            );
+        }
+    }
+
+    /// `signedtxdatahex` 必须是一笔**能反序列化、witness 已填、且 DER 签名验得过**的广播交易。
+    ///
+    /// 这条是「sign 组装 witness」的核心保证：它独立于生产代码，自己重算 BIP143 sighash、
+    /// 解出 witness 里的 DER 签名、用真值公钥验签。任何装配错误（DER 形态、SIGHASH 字节、
+    /// `[签名, 公钥]` 顺序）都会让它变红——而不是等到广播才暴露。
+    #[test]
+    fn signedtxdatahex_is_a_broadcastable_transaction() {
+        let tx = fixture_tx();
+        let ctx = fixture_context();
+        let result = sign_btc(&fixture_txdata(), &ctx, &fixture_key()).expect("夹具应能正常签名");
+        let signed = result.signedtxdatahex.expect("应返回 signedtxdatahex");
+
+        // 1) 能反序列化为带 witness 的完整交易。
+        let signedtxdatahex: Transaction = encode::deserialize_hex(signed.strip_prefix("0x").unwrap())
+            .expect("signedtxdatahex 应是合法交易 hex");
+        assert_eq!(signedtxdatahex.input.len(), tx.input.len(), "输入数不应变");
+        for (index, inp) in signedtxdatahex.input.iter().enumerate() {
+            assert!(!inp.witness.is_empty(), "第 {index} 个输入的 witness 必须已填");
+            // P2WPKH witness = [DER 签名, 压缩公钥]，恰两项。
+            assert_eq!(inp.witness.len(), 2, "第 {index} 个输入的 witness 应恰有 2 项");
+        }
+
+        // 3) `txhash` 必须等于这笔已签名交易的链上 txid（独立重算，不依赖生产代码）。
+        // `compute_txid()` 对 `signedtxdatahex` 反序列化后的交易直接算 double-SHA256 反序，
+        // 与 `sign_btc` 内部调用的同一方法——但这里是测试自己算的，能钉住「返回的 txhash 确为本交易」。
+        let expected_txhash = format!("0x{}", signedtxdatahex.compute_txid());
+        assert_eq!(
+            result.txhash.as_deref(),
+            Some(expected_txhash.as_str()),
+            "txhash 应等于已签名交易的 txid"
+        );
+        // 形态：0x + 64 hex 字符。
+        let h = result.txhash.as_ref().unwrap();
+        assert!(
+            h.starts_with("0x") && h.len() == 66,
+            "txhash 应为 0x + 64 位 hex，实际: {h}"
+        );
+
+        // 2) 每个 witness 里的 DER 签名都能用真值公钥验过独立算出的 BIP143 sighash。
+        let secp = Secp256k1::new();
+        let public_key = SecpPublicKey::from_slice(&hex::decode(FIXTURE_PUBKEY).unwrap()).unwrap();
+        let hashes = bip143_sighashes(&signedtxdatahex, &ctx);
+        for (index, _h) in hashes.iter().enumerate() {
+            let items = signedtxdatahex.input[index].witness.to_vec();
+            // 第一项是 DER 签名（尾部带 SIGHASH_ALL 字节），去掉尾巴再解码。
+            let der = items.first().expect("witness 首项为签名");
+            assert_eq!(der.last().copied(), Some(0x01), "SIGHASH 字节应为 SIGHASH_ALL(0x01)");
+            let sig = SecpSignature::from_der(&der[..der.len() - 1])
+                .expect("witness 里的签名应能被 DER 解码");
+            assert!(
+                secp
+                    .verify_ecdsa(&Message::from_digest(hashes[index]), &sig, &public_key)
+                    .is_ok(),
+                "第 {index} 个 witness 签名没能用真值公钥验过"
             );
         }
     }

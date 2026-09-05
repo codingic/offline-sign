@@ -7,9 +7,9 @@
 //!
 //! # 输入 / 输出契约
 //!
-//! - **输入**：`txdatahex` —— hex 字符串（可带 `0x`），解码后是**完整交易**的
+//! - **输入**：`unsignedtxdatahex` —— hex 字符串（可带 `0x`），解码后是**完整交易**的
 //!   Borsh 编码，即 `near_primitives::transaction::Transaction`（结构完整、只差签名）。
-//! - **输出**：`signed_tx` = hex 的 Borsh `SignedTransaction`，可直接 `broadcast_tx_commit`。
+//! - **输出**：`signedtxdatahex` = hex 的 Borsh `SignedTransaction`，可直接 `broadcast_tx_commit`。
 //!
 //! # 本链最容易踩的坑：密钥的字节表示
 //!
@@ -36,9 +36,9 @@ use crate::store::StoredKey;
 /// 也和 BTC 的 sighash、SUI 的 intent 前缀各不相同。
 /// 判据是节点自己的校验（`near-primitives` 的 `ValidatedTransaction::new`），
 /// 底部测试把这一行原样搬过来当判据了。
-pub fn sign_near(txdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
+pub fn sign_near(unsignedtxdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
     // hex 字符串 -> 字节。各链自己解码，报错时才能说清「这段字节本该是什么」。
-    let txdata = decode_txdata(txdatahex, "NEAR 完整交易（Borsh 编码）")?;
+    let txdata = decode_txdata(unsignedtxdatahex, "NEAR 完整交易（Borsh 编码）")?;
 
     // NEAR SecretKey 内部是 64 字节 keypair（种子 32 + 公钥 32），由种子重建。
     let sk_dalek = SigningKey::from_bytes(&key.seed);
@@ -52,7 +52,7 @@ pub fn sign_near(txdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResul
     //
     // 判据来自节点自己的代码（`near-primitives-0.37.3/src/transaction.rs:291`，
     // `ValidatedTransaction::new` 内部）：
-    //   `signed_tx.signature.verify(signed_tx.get_hash().as_ref(), …)`
+    //   `signedtxdatahex.signature.verify(signedtxdatahex.get_hash().as_ref(), …)`
     // 而 `get_hash()` = `sha256(borsh(transaction))`。
     //
     // 签裸 borsh 字节时：签名在数学上完全合法、本地也能验过，
@@ -84,9 +84,13 @@ pub fn sign_near(txdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResul
     Ok(SignedResult {
         signature: sig_hex.clone(),
         signatures: vec![sig_hex],
-        signed_tx: Some(format!("0x{}", hex::encode(out))),
+        signedtxdatahex: Some(format!("0x{}", hex::encode(out))),
+        txhash: None,
         encoding: "hex".to_string(),
-        note: None,
+        note: Some(
+            "NEAR 的交易哈希需要出块时的 block hash 参与计算，离线签名阶段拿不到，故不返回 txhash；\
+             广播后由节点返回 transaction hash".to_string(),
+        ),
     })
 }
 

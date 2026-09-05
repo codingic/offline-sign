@@ -3,9 +3,10 @@
 //! 仅监听回环地址（`127.0.0.1`），**无任何鉴权**——本服务只应在本机被信任的程序调用。
 //!
 //! 端点（与 acli 的统一信封结构一致）：
-//! - `POST /v1/signtx`  body `{chaintype, txdatahex, fromaddress[, context]}`
+//! - `POST /v1/signtx`  body `{chaintype, unsignedtxdatahex, fromaddress[, context]}`
 //!   用 `fromaddress` 对应的私钥签名并组装可广播交易。
 //! - `GET  /v1/chains`                       列出支持的链、所用曲线、公钥与本 keystore 的地址。
+//! - `GET  /v1/keys`                         极简公钥清单：逐链返回 chain 与 public_key（不含 address 等）。
 //! - `GET  /v1/keystore`                     列出 keystore 目录与两个文件的状态。
 //!
 //! ## `context` 字段：只有 BTC 需要
@@ -105,7 +106,7 @@ struct SignBody {
     /// 「完整」= 结构完整、只差签名：nonce / gas / fee / 接收方 / 金额 等字段都已填好，
     /// 由调用方（实际是 allchain SDK 的 `build_transfer`）产出。
     /// 本服务**不**接收单独的待签哈希，也不自己拼字段。
-    txdatahex: String,
+    unsignedtxdatahex: String,
     /// 由 `/v1/chains` 给出的地址（签名所用私钥在内存中按此地址索引）。
     fromaddress: String,
     /// **仅 BTC 需要**：SDK `build_transfer` 下发的 `extra.submit_context`，原样回传。
@@ -134,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(root_handler))
         .route("/v1/chains", get(chains_handler))
+        .route("/v1/keys", get(keys_handler))
         .route("/v1/keystore", get(keystore_handler))
         .route("/v1/signtx", post(signtx_handler))
         .with_state(state);
@@ -141,8 +143,9 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{}:{}", cli.host, cli.port);
     eprintln!();
     eprintln!("sign offline-signer listening on http://{addr}  (loopback only, no auth)");
-    eprintln!("  POST /v1/signtx  body: {{chaintype, txdatahex, fromaddress[, context]}}");
+    eprintln!("  POST /v1/signtx  body: {{chaintype, unsignedtxdatahex, fromaddress[, context]}}");
     eprintln!("  GET  /v1/chains");
+    eprintln!("  GET  /v1/keys");
     eprintln!("  GET  /v1/keystore");
     eprintln!();
 
@@ -287,7 +290,7 @@ async fn root_handler() -> Response {
     ok(
         json!({
             "service": "sign offline-signer",
-            "endpoints": ["POST /v1/signtx", "GET /v1/chains", "GET /v1/keystore"],
+            "endpoints": ["POST /v1/signtx", "GET /v1/chains", "GET /v1/keys", "GET /v1/keystore"],
             "keys": "two persistent keys (secp256k1 + ed25519), encrypted at rest with a password",
             "warning": "loopback-only, no auth"
         }),
@@ -312,17 +315,39 @@ async fn chains_handler(State(state): State<AppState>) -> Response {
                 // 而公钥无法从地址反推（地址是公钥的哈希）。
                 // 这里给的是压缩公钥的十六进制，可直接原样传给 SDK。
                 "public_key": info.public_key,
-                "signed_tx_encoding": if *c == "sol" || *c == "sui" { "base64" } else { "hex" },
-                // TON 与 BTC 与 ICP 都只出签名：TON 的完整 message 要钱包 code + state-init，
-                // BTC 的交易要 submit_context + 签名数组，ICP 的 ingress 信封要 caller/method/arg——
-                // 三者都由 SDK 组装。
-                "assembles_full_tx": *c != "ton" && *c != "btc" && *c != "icp",
+                "signedtxdatahex_encoding": if *c == "sol" || *c == "sui" { "base64" } else { "hex" },
+                // BTC 现在返回完整 segwit tx、TON 返回完整 external message（签名前拼），二者都可直接广播。
+                // ICP 仍只返回签名前缀字节，须由调用方包进 CBOR envelope——故 assembles_full_tx 仅对 ICP 为 false。
+                "assembles_full_tx": *c != "icp",
                 // 调用方据此决定 `signtx` 要不要带 context，不必硬记「哪条链特殊」。
                 "needs_context": *c == "btc",
             }))
         })
         .collect();
     ok(json!({ "chains": chains, "count": chains.len() }), &timer)
+}
+
+/// `GET /v1/keys`：极简公钥清单——逐链只返回 `chain` 与 `public_key`。
+///
+/// 与 `/v1/chains` 的区别：后者还带 address / scheme / assembles_full_tx / needs_context
+/// 等能力信息；本端点只回答「这条链的公钥是什么」，给只需要公钥的调用方一个不解析
+/// 多余字段的窄接口（例如 BTC 的 `build_transfer` 入参就只认公钥）。
+/// 公钥口径与 `/v1/chains` 完全一致（同一条种子、同一套派生），二者可互相对拍。
+async fn keys_handler(State(state): State<AppState>) -> Response {
+    let timer = Timer::start();
+    let keys: Vec<Value> = keys::CHAINS
+        .iter()
+        .filter_map(|c| {
+            let scheme = keys::scheme_for(c)?;
+            let seed = state.vault.seed_for(scheme);
+            let info = keys::derive(c, seed).ok()?;
+            Some(json!({
+                "chain": c,
+                "public_key": info.public_key,
+            }))
+        })
+        .collect();
+    ok(json!({ "keys": keys, "count": keys.len() }), &timer)
 }
 
 /// `GET /v1/keystore`：两个文件的路径与是否存在。
@@ -388,18 +413,10 @@ async fn signtx_handler(
             )
         }
     };
-    // `context` 已废弃：BTC 现只支持 P2PKH，传统 sighash 不含金额，
-    // `txdatahex` 成了唯一输入，不再需要 SDK 下发的 `submit_context`。
-    // 仍传它的调用方多半是按旧契约写的——显式报错比静默忽略更诚实，
-    // 否则对方会以为自己传的 `submit_context` 生效了（见 `SignBody::context` 的注释）。
-    if body.context.is_some() {
-        return err(
-            ErrorCode::InvalidArgument,
-            "context 已废弃：BTC 现只支持 P2PKH，txdatahex 是唯一输入，请勿再传 context",
-            &timer,
-        );
-    }
-    match sign::sign(&body.chaintype, &body.txdatahex, body.context.as_ref(), &key).await {
+    // BTC 必须带 `context`（P2WPKH 的 BIP143 sighash 需要输入金额，而金额不在交易字节里）；
+    // 其余链传了 `context` 会被 `sign()` 明确拒绝。「context 的有无」由 `sign()` 按链校验，
+    // 这里只原样透传，不重复判断。
+    match sign::sign(&body.chaintype, &body.unsignedtxdatahex, body.context.as_ref(), &key).await {
         Ok(r) => {
             let data = json!({
                 "chain": body.chaintype,
@@ -409,7 +426,9 @@ async fn signtx_handler(
                 // 多签名链（BTC）的完整结果在这里；单签名链只有一项。
                 "signatures": r.signatures,
                 "signature_count": r.signatures.len(),
-                "signed_tx": r.signed_tx,
+                "signedtxdatahex": r.signedtxdatahex,
+                // BTC / ETH 随响应返回链上 txid；其余链为 null（见各链 note 说明为何不可得）。
+                "txhash": r.txhash,
                 "encoding": r.encoding,
                 "note": r.note,
             });

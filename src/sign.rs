@@ -5,16 +5,16 @@
 //! 本模块只放**跨链共用的东西**（结果类型 `SignedResult` 与按链分派的 [`sign`]），
 //! 各链的实现分别在同目录下的独立文件里：
 //!
-//! | 文件 | 链 | 序列化 | `signed_tx` 编码 |
+//! | 文件 | 链 | 序列化 | `signedtxdatahex` 编码 |
 //! |---|---|---|---|
 //! | `eth.rs`  | eth  | RLP    | hex |
-//! | `btc.rs`  | btc  | bitcoin 字节格式 | —（只出签名） |
+//! | `btc.rs`  | btc  | bitcoin 字节格式 | 完整 segwit 交易 hex（带 witness） |
 //! | `sol.rs`  | sol  | bincode| base64 |
 //! | `near.rs` | near | Borsh  | hex |
 //! | `apt.rs`  | apt  | BCS    | hex |
 //! | `sui.rs`  | sui  | BCS    | base64 |
-//! | `ton.rs`  | ton  | —（仅签名）| — |
-//! | `icp.rs`  | icp  | —（仅签名）| — |
+//! | `ton.rs`  | ton  | external message（签名前拼）| 完整 external message hex |
+//! | `icp.rs`  | icp  | ingress message（签名前拼）| 签名前缀 hex（须包进 CBOR envelope）|
 //!
 //! 分文件的理由：每条链都拖着一大堆只在自己身上成立的 `use` 与编码约定，
 //! 挤在一起时改一条链容易误伤另一条；分开后依赖关系一眼可见，
@@ -22,10 +22,10 @@
 //!
 //! # 统一的输入契约（先讲清楚「收到的是什么」）
 //!
-//! `txdatahex` 恒为**完整交易序列化后的 hex 字符串**（可带 `0x` 前缀）。
+//! `unsignedtxdatahex` 恒为**完整交易序列化后的 hex 字符串**（可带 `0x` 前缀）。
 //!
 //! **为什么各链函数收的是 `&str` 而不是 `&[u8]`**：HTTP 请求体里的字段就叫
-//! `txdatahex`，是个字符串。让每个 `sign_xxx` 直接收字符串、自己解码，
+//! `unsignedtxdatahex`，是个字符串。让每个 `sign_xxx` 直接收字符串、自己解码，
 //! 它就能在解码失败时给出**这条链特有的**错误信息——BTC 会说
 //! 「需序列化的未签名交易」，而不是一句对所有链都成立的「需 hex」。
 //! 若在分派层统一解码后再往下传字节，这份信息就丢了。
@@ -45,15 +45,15 @@
 //! # 唯一的例外：BTC 需要额外的 `context`
 //!
 //! BTC 是 UTXO 模型，每个输入各有一个 sighash；而 P2WPKH 的 sighash 走 BIP143，
-//! 需要**该输入的金额**，金额却不在交易字节里。所以 BTC 除 `txdatahex` 之外，
+//! 需要**该输入的金额**，金额却不在交易字节里。所以 BTC 除 `unsignedtxdatahex` 之外，
 //! 还要把 SDK `build_transfer` 下发的 `extra.submit_context` 原样传进来。
 //! 详见 `btc.rs` 的模块文档。
 //!
 //! # `signtx` 的语义
 //!
 //! 本模块用内存里 `fromaddress` 对应的种子重建签名器，对这笔完整交易签名，
-//! 再把签名装配回交易，返回 `{signature, signed_tx}`。
-//! `signed_tx` 是该链可直接广播的编码。
+//! 再把签名装配回交易，返回 `{signature, signedtxdatahex}`。
+//! `signedtxdatahex` 是该链可直接广播的编码。
 //!
 //! 各链「完整交易」的序列化格式（细节见对应文件）：
 //! - eth ：RLP 编码的交易（typed / legacy 均可），对应 MetaMask 离线签名输入。
@@ -61,11 +61,12 @@
 //! - near：Borsh 编码的 `near_primitives::transaction::Transaction`。
 //! - apt ：BCS 编码的 `aptos_sdk::transaction::types::RawTransaction`。
 //! - sui ：BCS 编码的 `sui_sdk_types::Transaction`。
-//! - ton ：external message 的完整序列化字节（本服务只出签名，不组装 message）。
-//!   通用签名器只出 ed25519 签名，完整 external message 组装需钱包 code + state-init。
-//! - icp ：ingress message / envelope 的完整序列化字节（本服务只出签名，不组装信封）。
-//!   地址（self-authenticating principal）由公钥派生，见 `keys.rs`；完整请求组装需
-//!   caller principal、method、arg，由调用方负责。
+//! - ton ：external message 的完整序列化字节；本服务把 64 字节签名前拼到消息前，
+//!   返回可直接广播的完整 external message（钱包 code + state-init 须由调用方提供）。
+//! - icp ：ingress message / envelope 的完整序列化字节；本服务把 64 字节签名前拼到字节前，
+//!   返回 `signedtxdatahex`（签名前缀字节）。IC 真正可广播的是 CBOR envelope，调用方须把
+//!   此 `signature` 填进 `envelope.sender_sig` 后广播。地址（self-authenticating principal）
+//!   由公钥派生，见 `keys.rs`。
 
 mod apt;
 mod btc;
@@ -101,9 +102,20 @@ pub struct SignedResult {
     /// 单签名链只有一项，与 `signature` 相同；保留两个字段是为了让调用方
     /// 既能统一遍历 `signatures`，又不必为单签名场景再多解一层。
     pub signatures: Vec<String>,
-    /// 装配好的可广播交易；TON 与 BTC 为 `None`（见各链文件说明）。
-    pub signed_tx: Option<String>,
-    /// `signed_tx` 的编码：`"hex"` 或 `"base64"`。
+    /// 装配好的可广播交易；TON 为完整 external message，ICP 为签名前缀字节（须包进 CBOR envelope，见各链文件说明）。
+    pub signedtxdatahex: Option<String>,
+    /// 该交易在链上的哈希（txid / tx hash）。
+    ///
+    /// 只有** BTC 与 ETH **能在这里算出：
+    /// - BTC：`tx.compute_txid()`（double-SHA256 反序，即区块浏览器里看到的 txid）；
+    /// - ETH：`keccak256(signedtxdatahex 字节)`（节点对 `eth_sendRawTransaction` 入参哈希即得）。
+    ///
+    /// 其余链在「只拿原始字节、不做链结构解析」的前提下**算不出**：
+    /// NEAR 需要出块时的 block hash；TON / ICP 需要解析 cell / CBOR envelope；
+    /// SOL / APT / SUI 的哈希依赖各自的链结构（SOL 的 txid 即签名本身，见各链 `note`）。
+    /// 这些链统一返回 `None`，由调用方在拿到结构后再算或在广播后向节点查询。
+    pub txhash: Option<String>,
+    /// `signedtxdatahex` 的编码：`"hex"` 或 `"base64"`。
     pub encoding: String,
     /// 附加说明（如 TON 的组装限制）。
     pub note: Option<String>,
@@ -123,7 +135,7 @@ pub(crate) fn strip_0x(s: &str) -> &str {
     }
 }
 
-/// 把 `txdatahex` 解成字节。
+/// 把 `unsignedtxdatahex` 解成字节。
 ///
 /// # 参数 `what`
 ///
@@ -136,8 +148,8 @@ pub(crate) fn strip_0x(s: &str) -> &str {
 ///
 /// `trim()` 先去掉首尾空白：调用方常把 hex 嵌在多行 JSON 或 shell 变量里，
 /// 带一个换行是很常见的。剥前缀**放在** trim 之后，否则 `" 0xab"` 会先剥失败。
-pub(crate) fn decode_txdata(txdatahex: &str, what: &str) -> anyhow::Result<Vec<u8>> {
-    let body = strip_0x(txdatahex.trim());
+pub(crate) fn decode_txdata(unsignedtxdatahex: &str, what: &str) -> anyhow::Result<Vec<u8>> {
+    let body = strip_0x(unsignedtxdatahex.trim());
     hex::decode(body).map_err(|e| {
         anyhow::anyhow!(
             "{what} 的 hex 解码失败（需 hex 字符串，可带 0x 前缀，收到 {} 个字符）: {e}",
@@ -148,7 +160,7 @@ pub(crate) fn decode_txdata(txdatahex: &str, what: &str) -> anyhow::Result<Vec<u
 
 /// 入口：按链分派到具体实现。
 ///
-/// # 参数 `txdatahex`
+/// # 参数 `unsignedtxdatahex`
 ///
 /// **hex 字符串**，不是字节。解码由各链自己完成（见模块头的说明），
 /// 这样每条链都能给出自己的解码错误信息。
@@ -168,7 +180,7 @@ pub(crate) fn decode_txdata(txdatahex: &str, what: &str) -> anyhow::Result<Vec<u
 /// 子模块里的函数要先经过模块路径才能访问，就像 `std::fs::read` 那样。
 pub async fn sign(
     chain: &str,
-    txdatahex: &str,
+    unsignedtxdatahex: &str,
     context: Option<&Value>,
     key: &StoredKey,
 ) -> Result<SignedResult, SdkError> {
@@ -187,7 +199,7 @@ pub async fn sign(
         };
         // 各链函数仍返回 `anyhow::Result`；在边界上用 sign 专属分类器把报错
         // 归到正确的错误码，而不是让 `?` 走 SDK 的 RPC 分类器（会把参数错判成 RpcError）。
-        return btc::sign_btc(txdatahex, ctx, key).map_err(|e| sign_classify(&e.to_string()));
+        return btc::sign_btc(unsignedtxdatahex, ctx, key).map_err(|e| sign_classify(&e.to_string()));
     }
     if context.is_some() {
         return Err(SdkError::invalid_argument(format!(
@@ -198,13 +210,13 @@ pub async fn sign(
     // 其余链都不需要 context。每个分支产出 `anyhow::Result<SignedResult>`，
     // 在 `match` 出口统一分类——这样 10 个链文件一个都不用动。
     match chain {
-        "eth" => eth::sign_eth(txdatahex, key).await,
-        "sol" => sol::sign_sol(txdatahex, key),
-        "near" => near::sign_near(txdatahex, key),
-        "apt" => apt::sign_apt(txdatahex, key),
-        "sui" => sui::sign_sui(txdatahex, key),
-        "ton" => ton::sign_ton(txdatahex, key),
-        "icp" => icp::sign_icp(txdatahex, key),
+        "eth" => eth::sign_eth(unsignedtxdatahex, key).await,
+        "sol" => sol::sign_sol(unsignedtxdatahex, key),
+        "near" => near::sign_near(unsignedtxdatahex, key),
+        "apt" => apt::sign_apt(unsignedtxdatahex, key),
+        "sui" => sui::sign_sui(unsignedtxdatahex, key),
+        "ton" => ton::sign_ton(unsignedtxdatahex, key),
+        "icp" => icp::sign_icp(unsignedtxdatahex, key),
         other => Err(anyhow::anyhow!(
             "不支持的链: {other}（可选 eth / btc / sol / near / apt / sui / ton / icp）"
         )),

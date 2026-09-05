@@ -105,7 +105,7 @@
         );
     }
 
-    /// `signed_tx` 里的 `UserSignature` 必须是 `flag ‖ sig(64) ‖ pubkey(32)` = 97 字节。
+    /// `signedtxdatahex` 里的 `UserSignature` 必须是 `flag ‖ sig(64) ‖ pubkey(32)` = 97 字节。
     ///
     /// 这个布局一旦错位（比如把公钥放前面），节点就认不出签名者是谁。
     #[test]
@@ -117,10 +117,10 @@
         let key = fixture_key();
         let out = sign_sui(&hex::encode(&bcs), &key).expect("应能签名");
 
-        let raw = out.signed_tx.expect("SUI 必须产出 signed_tx");
+        let raw = out.signedtxdatahex.expect("SUI 必须产出 signedtxdatahex");
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(raw)
-            .expect("signed_tx 应是合法 base64");
+            .expect("signedtxdatahex 应是合法 base64");
         let signed: SignedTransaction =
             bcs::from_bytes(&bytes).expect("产出应能解回 SignedTransaction");
 
