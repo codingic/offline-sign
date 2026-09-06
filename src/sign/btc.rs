@@ -68,7 +68,7 @@
 
 use bitcoin::consensus::encode;
 use bitcoin::hashes::Hash;
-use bitcoin::secp256k1::{ecdsa::Signature as SecpSignature, Message, PublicKey as SecpPublicKey, Secp256k1, SecretKey};
+use bitcoin::secp256k1::{ecdsa::Signature as SecpSignature, All, Message, PublicKey as SecpPublicKey, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{Amount, ScriptBuf, Transaction, Witness};
 use serde::Deserialize;
@@ -327,31 +327,9 @@ pub fn sign_btc(
         tx.input[index].witness = Witness::from_slice(&[der.as_slice(), ours.as_slice()]);
     }
 
-    // 组装后自检：用同一笔交易重算 BIP143 sighash，验证 witness 里 DER 签名能验过——
-    // 直接锁死「witness 填对了（顺序、DER 形态、SIGHASH 字节）」，否则要等到广播才暴露。
-    let mut final_cache = SighashCache::new(&tx);
-    for (index, (script, value)) in witness_metas.iter().enumerate() {
-        let items = tx.input[index].witness.to_vec();
-        let der = match items.first() {
-            Some(d) => d,
-            None => return Err(anyhow::anyhow!(
-                "第 {index} 个输入的 witness 组装后为空：witness 未被正确填入"
-            )),
-        };
-        // witness 首项 = `DER 签名 || SIGHASH_ALL`；剥掉尾字节才是纯 DER，才能 `from_der`。
-        if der.last().copied() != Some(SIGHASH_ALL_BYTE) {
-            return Err(anyhow::anyhow!(
-                "第 {index} 个输入的 witness 签名尾字节不是 SIGHASH_ALL(0x01)"
-            ));
-        }
-        let recovered = SecpSignature::from_der(&der[..der.len() - 1])
-            .map_err(|e| anyhow::anyhow!("第 {index} 个输入的 DER 签名无法解码: {e}"))?;
-        let sh = final_cache
-            .p2wpkh_signature_hash(index, script, *value, EcdsaSighashType::All)
-            .map_err(|e| anyhow::anyhow!("第 {index} 个输入最终 sighash 失败: {e}"))?;
-        secp.verify_ecdsa(&Message::from_digest(sh.to_byte_array()), &recovered, &public_key)
-            .map_err(|e| anyhow::anyhow!("第 {index} 个输入组装后的 witness 验签失败: {e}"))?;
-    }
+    // 组装后自检：装配进 witness 后，重算 BIP143 sighash 验证 DER 签名能验过——
+    // 把「witness 填错形态/顺序」这类「本地签名成功、广播才拒」的隐患前移成当场报错。
+    verify_btc_witness(&tx, &public_key, &secp, &witness_metas)?;
 
     // `signature`（单数）保留第一个，让「单签名链」的调用方无需按链分支；
     // BTC 的完整结果请看 `signatures` 与 `signedtxdatahex`。
@@ -379,6 +357,67 @@ pub fn sign_btc(
                 .to_string(),
         ),
     })
+}
+
+/// 组装后自检：用同一笔已填好 witness 的交易重算 BIP143 sighash，验证每个输入 witness 里
+/// 的 DER 签名都能用本密钥公钥验过——直接锁死「witness 填对了（顺序、DER 形态、SIGHASH 字节）」。
+///
+/// # 为什么单独成函数
+///
+/// 这块逻辑原本内联在 `sign_btc` 末尾，但它与「签名循环」职责不同：
+/// 签名循环关心「算出 sighash、签出紧凑签名」，本函数关心「装配进 witness 后，
+/// DER 形态 + 顺序 + SIGHASH 字节都正确」。拆出来后，`sign_btc` 主流程只剩
+/// 「签名 → 装配」一条主线，自检验证作为独立、可单测的纯函数存在，
+/// 将来即便要换装配策略也能单独对拍，不必带着整个签名上下文一起改。
+///
+/// # 入参
+///
+/// - `tx`：已填好 witness 的**完整 segwit 交易**（不是未签名模板）；
+/// - `public_key`：本密钥的**压缩**公钥（33 字节），与签名时同一把；
+/// - `secp`：复用的 secp256k1 上下文（`sign_btc` 里 `Secp256k1::new()` 建好的，
+///   避免本函数再 `new` 一次；`All` 同时具备签名与验签能力，这里只用验签）；
+/// - `witness_metas`：每个输入的 `(scriptCode, 金额)`，来自 `sign_btc` 的签名循环，
+///   与 `tx.input` 一一对应——BIP143 sighash 必须用它重算摘要。
+///
+/// # 失败语义
+///
+/// 任一输入出现「witness 为空 / DER 尾字节非 SIGHASH_ALL / DER 解码失败 / 验签失败」
+/// 任一情况都立即返回 `Err`；调用方据此把「本地签名成功、广播才拒」的隐患前移成当场报错。
+fn verify_btc_witness(
+    tx: &Transaction,
+    public_key: &SecpPublicKey,
+    secp: &Secp256k1<All>,
+    witness_metas: &[(ScriptBuf, Amount)],
+) -> anyhow::Result<()> {
+    // `SighashCache::new(&tx)` 对**已填 witness** 的交易重新建立摘要缓存：
+    // BIP143 的 sighash 只看本输入的 `scriptCode + 金额`，并不依赖 witness 内容本身，
+    // 故填好 witness 后重算出的 sighash 与签名时完全一致。
+    let mut cache = SighashCache::new(tx);
+    for (index, (script, value)) in witness_metas.iter().enumerate() {
+        // 取该输入 witness 的首项——它应是 `DER 签名 || SIGHASH_ALL`；为空说明装配漏了。
+        let items = tx.input[index].witness.to_vec();
+        let der = match items.first() {
+            Some(d) => d,
+            None => return Err(anyhow::anyhow!(
+                "第 {index} 个输入的 witness 组装后为空：witness 未被正确填入"
+            )),
+        };
+        // witness 首项尾字节必须是 SIGHASH_ALL(0x01)；剥掉它才是纯 DER，才能 `from_der`。
+        if der.last().copied() != Some(SIGHASH_ALL_BYTE) {
+            return Err(anyhow::anyhow!(
+                "第 {index} 个输入的 witness 签名尾字节不是 SIGHASH_ALL(0x01)"
+            ));
+        }
+        let recovered = SecpSignature::from_der(&der[..der.len() - 1])
+            .map_err(|e| anyhow::anyhow!("第 {index} 个输入的 DER 签名无法解码: {e}"))?;
+        // 重算 BIP143 sighash 并验签：锁死「witness 填对了（顺序、DER 形态、SIGHASH 字节）」。
+        let sh = cache
+            .p2wpkh_signature_hash(index, script, *value, EcdsaSighashType::All)
+            .map_err(|e| anyhow::anyhow!("第 {index} 个输入最终 sighash 失败: {e}"))?;
+        secp.verify_ecdsa(&Message::from_digest(sh.to_byte_array()), &recovered, public_key)
+            .map_err(|e| anyhow::anyhow!("第 {index} 个输入组装后的 witness 验签失败: {e}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)] mod tests;

@@ -190,3 +190,81 @@
             "signedtxdatahex 的签名应恢复到本 keystore 在 eth 上的地址（说明签的是这笔交易、且密钥正确）"
         );
     }
+
+    /// ERC20 transfer 走通：构造一笔 `transfer(address,uint256)` 调用的 EIP-1559 交易，
+    /// 经 `sign_eth` 签名后，`signedtxdatahex` 仍是裸 EIP-2718、`to` 是 token 合约、
+    /// `input` 是合法 calldata，且 `note` 标注出 token/recipient/amount。
+    ///
+    /// 关键不变量：sign 作为纯离线签名器，**不**因 ERC20 而改变签名行为——
+    /// 它签的就是「一笔完整交易」，ERC20 只在 note 里被解析标注，便于对账。
+    #[tokio::test]
+    async fn signs_an_erc20_transfer_and_annotates_it() {
+        use alloy::consensus::{EthereumTxEnvelope, SignableTransaction, TxEip1559};
+        use alloy::consensus::Transaction;
+        use alloy::eips::eip2718::Decodable2718;
+        use alloy::primitives::{address, TxKind};
+
+        // token 合约地址与收款地址（任意有效地址，测试不广播）。
+        let token = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let amount = U256::from(1_250_000_000_000u128); // 0.00125 个 token（以 6 位小数为例）
+
+        // 手工拼 `transfer(address,uint256)` 的 ABI calldata。
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]); // selector = keccak256("transfer(address,uint256)")[..4]
+        let mut recipient_word = [0u8; 32];
+        recipient_word[12..32].copy_from_slice(recipient.as_slice()); // address 左填充 0 到 32 字节
+        data.extend_from_slice(&recipient_word);
+        let amount_word: [u8; 32] = amount.to_be_bytes(); // uint256 大端 32 字节
+        data.extend_from_slice(&amount_word);
+
+        // 组装一笔 EIP-1559 交易（value=0，因为是代币转账、ETH 不随附）。
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 0,
+            gas_limit: 60_000,
+            max_fee_per_gas: 30_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(token),
+            value: U256::ZERO,
+            input: data.clone().into(),
+            access_list: Default::default(),
+        };
+        // 取「待签原像」（与 SDK `assemble_unsigned` 同口径），前缀 0x 交给 sign_eth 解。
+        let mut buf = Vec::new();
+        tx.encode_for_signing(&mut buf);
+        let unsigned_hex = format!("0x{}", hex::encode(&buf));
+
+        let key = StoredKey { scheme: Scheme::Secp256k1, seed: [1u8; 32] };
+        let r = sign_eth(&unsigned_hex, &key)
+            .await
+            .expect("ERC20 未签名交易必须能签名");
+        let raw = r.signedtxdatahex.expect("ETH 必须产出 signedtxdatahex");
+
+        // 主断言 1：仍是裸 EIP-2718（不能以 RLP 字符串头开头）。
+        assert!(raw.starts_with("0x02"), "signedtxdatahex 应以 0x02 开头，实际: {raw}");
+        assert!(!raw.starts_with("0xb8"), "不应带 RLP 长字符串头，实际: {raw}");
+
+        // 主断言 2：解回来后 `to` 是 token、`input` 是原始 calldata（证明签的是同一笔 ERC20）。
+        let bytes = hex::decode(&raw[2..]).expect("signedtxdatahex 应是合法 hex");
+        let decoded: EthereumTxEnvelope<TxEip1559> =
+            EthereumTxEnvelope::decode_2718(&mut bytes.as_slice())
+                .expect("产出的字节应能被解回信封");
+        assert_eq!(decoded.to(), Some(token), "解回的 to 应为 token 合约");
+        let expected_input: Bytes = data.into();
+        assert_eq!(decoded.input(), &expected_input, "解回的 input 应为 ERC20 calldata");
+
+        // 主断言 3：note 标注出 ERC20 三方（token/recipient/amount），且 txhash 自洽。
+        let note = r.note.expect("note 不应为空");
+        assert!(note.contains("ERC20"), "note 应标注这是一笔 ERC20 交易，实际: {note}");
+        assert!(
+            note.contains(&format!("{recipient}")),
+            "note 应含收款地址 {recipient}，实际: {note}"
+        );
+        let expected_hash = format!("0x{}", hex::encode(keccak256(&bytes).as_slice()));
+        assert_eq!(
+            r.txhash.as_deref(),
+            Some(expected_hash.as_str()),
+            "txhash 应为 keccak256(signed bytes)"
+        );
+    }

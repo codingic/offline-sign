@@ -20,11 +20,15 @@
 //!   （结构完整、只差签名；typed / legacy 均可），对应 MetaMask 离线签名那一套输入。
 //! - **输出**：`signedtxdatahex` = hex 的 `EthereumTxEnvelope` RLP 字节，
 //!   可直接交给 `eth_sendRawTransaction`。
+//! - **ERC20**：代币转账就是一笔 `to=token 合约`、`data=transfer(recipient,amount) calldata`、
+//!   `value=0` 的 EIP-1559 交易，签名路径与 Native transfer 完全一致；`sign_eth` 会识别
+//!   `transfer(address,uint256)` 选择器（前 4 字节 `0xa9059cbb`）并把 token/recipient/amount
+//!   解码进 `note` 便于对账，签名行为本身不变。
 
 use alloy::consensus::TypedTransaction;
 use alloy::eips::eip2718::Encodable2718;
 use alloy::network::TxSigner;
-use alloy::primitives::keccak256;
+use alloy::primitives::{keccak256, Address, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
 use k256::ecdsa::SigningKey;
 
@@ -48,6 +52,80 @@ fn decode_unsignedtxdatahex(txdata: &[u8]) -> anyhow::Result<TypedTransaction> {
         .map_err(|e| anyhow::anyhow!("ETH 交易解码失败（需 RLP 未签名交易）: {e}"))
 }
 
+/// 从已解出的交易里抽取 `(to, input)`，用于识别 ERC20 transfer calldata。
+///
+/// # 语法要点
+///
+/// `TypedTransaction` 是枚举（Legacy / Eip2930 / Eip1559 / Eip4844 / Eip7702），
+/// 各变体的 `to` / `input` 字段形态不完全一致（Eip7702 的 `to` 是 `Address`、
+/// Eip4844 是变体枚举），逐个匹配会踩类型坑。这里只对真正会被 sign 签出的
+/// Legacy / Eip2930 / Eip1559 三态精确抽取，其余罕见类型用 `_` 兜底返回
+/// 「无 to / 空 input」——它们不会是 ERC20 transfer，识别成非 ERC20 即可。
+/// 返回 **owned `Bytes`**（内部 `Arc` 克隆，零拷贝成本），避免与 `tx` 的生命周期纠缠。
+fn tx_to_and_input(tx: &TypedTransaction) -> (Option<Address>, Bytes) {
+    match tx {
+        TypedTransaction::Legacy(t) => (t.to.to().copied(), t.input.clone()),
+        TypedTransaction::Eip2930(t) => (t.to.to().copied(), t.input.clone()),
+        TypedTransaction::Eip1559(t) => (t.to.to().copied(), t.input.clone()),
+        _ => (None, Bytes::new()),
+    }
+}
+
+/// 若 `tx` 是一笔 ERC20 `transfer(address,uint256)` 调用，解出 `(token, recipient, amount)`。
+///
+/// # 判定口径（不宽松，避免误判）
+///
+/// ERC20 `transfer` 的函数选择器是 `keccak256("transfer(address,uint256)")` 的前 4 字节
+/// = `0xa9059cbb`（标准 ABI，所有 ERC20 代币共用）。
+/// 合法 calldata 形态：`0xa9059cbb ‖ recipient(32 字节，末 20 字节为地址) ‖ amount(32 字节 uint256)`，
+/// 共 4 + 32 + 32 = 68 字节。仅当：
+/// 1. `to` 存在（合约调用；合约创建交易 `to=None` 不是 transfer）；
+/// 2. `input` 长度恰为 68；
+    /// 3. `input` 前 4 字节等于选择器；
+    ///
+    /// 三者同时满足才认定。
+    ///
+    /// 其余任何函数调用或任意长度 `data` 一律返回 `None`，
+    /// 不让「恰好前缀对上」的其它调用被错当成 transfer。
+///
+/// # 为什么要单独成函数
+///
+/// 它只读 `typed`、不改签名流程，拆出来后 `sign_eth` 主流程只剩「解码 → 识别 → 签名 → 装配」
+/// 一条主线；且本函数可被单测直接打（喂手造的 ERC20 tx，断言解出的 token/recipient/amount）。
+fn erc20_transfer_info(tx: &TypedTransaction) -> Option<(Address, Address, U256)> {
+    const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
+    let (to, input) = tx_to_and_input(tx);
+    let token = to?; // 合约调用才有 `to`；无 `to`（合约创建）不是 transfer。
+    if input.len() != 68 {
+        return None;
+    }
+    if input[..4] != TRANSFER_SELECTOR {
+        return None;
+    }
+    // recipient：32 字节 ABI 地址槽的**末 20 字节**（`address` 在 ABI 里左填充 0 到 32 字节）。
+    let recipient = Address::from_slice(&input[16..36]);
+    // amount：末 32 字节的 uint256（大端）。
+    let amount = U256::from_be_slice(&input[36..68]);
+    Some((token, recipient, amount))
+}
+
+/// 把 wei 计数的 `U256` 格式化成可读的 ETH 字符串（18 位小数，去尾随零）。
+///
+/// 仅用于 `note` 的人眼对账，不参与任何签名/哈希计算。
+fn format_eth_str(v: U256) -> String {
+    // 1 ETH = 10^18 wei。`U256::from(u128)` 在运行时求值（常量上下文里不能调非 const 函数）。
+    let wei_per_eth = U256::from(1_000_000_000_000_000_000u128);
+    let int_part = v / wei_per_eth;
+    let frac = v % wei_per_eth;
+    // `{frac:018}` 把余数补零到 18 位十进制，再切掉尾随零。
+    let frac_trimmed = format!("{frac:018}").trim_end_matches('0').to_string();
+    if frac_trimmed.is_empty() {
+        format!("{int_part}")
+    } else {
+        format!("{int_part}.{frac_trimmed}")
+    }
+}
+
 pub async fn sign_eth(unsignedtxdatahex: &str, key: &StoredKey) -> anyhow::Result<SignedResult> {
     // hex 字符串 -> 字节。各链自己解码，报错时才能说清「这段字节本该是什么」。
     let txdata = decode_txdata(unsignedtxdatahex, "ETH 完整交易（RLP 未签名交易）")?;
@@ -57,6 +135,11 @@ pub async fn sign_eth(unsignedtxdatahex: &str, key: &StoredKey) -> anyhow::Resul
     let signer = PrivateKeySigner::from_signing_key(sk);
 
     let mut typed = decode_unsignedtxdatahex(&txdata)?;
+
+    // ERC20 识别：若这是一笔 `transfer(address,uint256)` 调用，把 token/recipient/amount
+    // 解出来进 note，便于调用方对账。纯签名路径不受任何影响——ERC20 与 Native transfer
+    // 对签名器而言都是「一笔完整 EIP-1559 交易」，区别只在 `to`/`data` 字段。
+    let erc20 = erc20_transfer_info(&typed);
 
     // 合金签名器负责算哈希、EIP-155 v、产出可恢复签名。
     let signature = signer
@@ -86,10 +169,19 @@ pub async fn sign_eth(unsignedtxdatahex: &str, key: &StoredKey) -> anyhow::Resul
         signedtxdatahex: Some(format!("0x{}", hex::encode(tx_bytes))),
         txhash,
         encoding: "hex".to_string(),
-        note: Some(
-            "ETH 的 txhash 为 keccak256(signedtxdatahex 字节)，随响应一并返回，\
-             可直接用于 eth_getTransactionReceipt / eth_getTransactionByHash 等查询".to_string(),
-        ),
+        note: Some(match erc20 {
+            Some((token, recipient, amount)) => format!(
+                "ERC20 transfer：token {token} → recipient {recipient}，\
+                 amount {} wei (≈ {} ETH)。sign_eth 作为纯离线签名器直接对完整交易签名，\
+                 不构造、不解析合约逻辑；txhash 为 keccak256(signedtxdatahex 字节)，\
+                 可直接用于 eth_getTransactionReceipt / eth_getTransactionByHash 等查询。",
+                amount,
+                format_eth_str(amount)
+            ),
+            None => "ETH 的 txhash 为 keccak256(signedtxdatahex 字节)，随响应一并返回，\
+                     可直接用于 eth_getTransactionReceipt / eth_getTransactionByHash 等查询"
+                .to_string(),
+        }),
     })
 }
 
